@@ -1,0 +1,1 @@
+"""SnapNote FastAPI application package."""

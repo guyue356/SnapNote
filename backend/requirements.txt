@@ -1,0 +1,14 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+sqlalchemy>=2.0
+aiosqlite>=0.20
+aiofiles>=24.1
+sse-starlette>=2.1
+pydantic>=2.8
+python-dotenv>=1.0
+Pillow>=10.0
+ImageHash>=4.3
+# Optional heavyweight providers:
+# faster-whisper>=1.1
+# paddleocr>=2.9

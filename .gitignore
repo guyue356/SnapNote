@@ -1,0 +1,27 @@
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.next/
+frontend/.wrangler/
+frontend/.dev.*.log
+frontend/.env*
+!frontend/.env.example
+
+# Backend
+backend/.env
+backend/__pycache__/
+backend/**/__pycache__/
+backend/**/*.py[cod]
+.pytest_cache/
+
+# Runtime data
+storage/app.db
+storage/tasks/
+*.log
+.snapnote-pids.json
+
+# System / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
