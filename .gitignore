@@ -19,9 +19,13 @@ storage/app.db
 storage/tasks/
 *.log
 .snapnote-pids.json
+.snapnote-setup.json
 
 # System / editor
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+
+# Project docs
+PRD/

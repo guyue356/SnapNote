@@ -12,7 +12,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=111)](https://react.dev/)
 
-[在线体验](https://snapnote-visual-notes.yuegu827.chatgpt.site) · [产品需求文档](./SnapNote_Web_Demo_PRD_v1.md) · [API 文档](#api-接口)
+[本地启动](#方式二windows-一键启动) · [产品需求文档](./SnapNote_Web_Demo_PRD_v1.md) · [API 文档](#api-接口)
 
 </div>
 
@@ -25,7 +25,7 @@
 SnapNote 将视频中的关键画面、带时间戳的语音片段和结构化总结绑定在同一条时间线上。用户可以按 PPT 页面浏览摘要与知识点，点击画面或时间标签直接回到视频原位置，并将结果导出为 Markdown。项目面向学生、研究人员、职场学习者与内容整理者，当前优先优化录屏、在线课程、培训和稳定机位拍摄的 PPT 视频。
 
 > [!IMPORTANT]
-> 在线站点使用无需后端即可运行的浏览器演示模式，适合体验完整交互。真实视频解析、ffmpeg 抽帧、本地 Whisper、OCR 和 DeepSeek 增强需要在本地启动 FastAPI 后端。
+> 项目当前以本地运行作为主要使用方式。真实视频解析、ffmpeg 抽帧、本地 Whisper、OCR 和 DeepSeek 增强由本地 FastAPI 后端完成。
 
 ---
 
@@ -49,7 +49,7 @@ SnapNote 将视频中的关键画面、带时间戳的语音片段和结构化�
 
 ### 5. 双运行模式
 
-- **浏览器演示模式**：不设置后端地址，任务、进度和示例笔记保存在 `localStorage`，便于直接部署和体验。
+- **浏览器演示模式**：不设置后端地址，任务、进度和示例笔记保存在 `localStorage`，便于不启动后端时体验界面。
 - **真实处理模式**：设置 `NEXT_PUBLIC_API_BASE_URL`，前端改用 FastAPI、SQLite、本地文件与 SSE 处理真实视频。
 
 ### 6. Markdown 导出与历史任务
@@ -60,9 +60,9 @@ SnapNote 将视频中的关键画面、带时间戳的语音片段和结构化�
 
 ## 效果展示
 
-### 在线 Demo
+### 本地 Demo
 
-访问 **[SnapNote 在线演示](https://snapnote-visual-notes.yuegu827.chatgpt.site)**，无需配置后端即可体验：
+双击 `start-snapnote.cmd`，然后访问 **http://127.0.0.1:43871**：
 
 1. 拖入 MP4、MOV 或 WebM 视频；
 2. 选择识别方案与笔记类型；
@@ -116,11 +116,15 @@ SnapNote 将视频中的关键画面、带时间戳的语音片段和结构化�
 2. 检查 Conda、Node.js 22.13+ 和 ffmpeg
 3. 在仓库根目录运行 .\start.ps1
 4. 如果需要真实 ASR，请按 README 配置 backend/.env
-5. 验证 http://localhost:3000 和 http://localhost:8001/api/health
+5. 验证 http://127.0.0.1:43871 和 http://127.0.0.1:43872/api/health
 请保留现有配置，不要提交任何 API Key。
 ```
 
 ### 方式二：Windows 一键启动
+
+克隆项目后，可以直接双击根目录的 `start-snapnote.cmd`。脚本会在后台启动前后端，确认服务正常后自动打开浏览器。需要关闭时双击 `stop-snapnote.cmd`。
+
+也可以在 PowerShell 中运行：
 
 ```powershell
 git clone https://github.com/guyue356/SnapNote.git
@@ -133,8 +137,15 @@ cd SnapNote
 - 创建名为 `snapnote` 的 Python 3.10 Conda 环境；
 - 安装前后端依赖；
 - 从示例创建本地环境配置；
-- 在 `http://localhost:3000` 启动 Web；
-- 在 `http://localhost:8001` 启动 API。
+- 在 `http://127.0.0.1:43871` 启动 Web；
+- 在 `http://127.0.0.1:43872` 启动 API；
+- 将运行日志保存到 `.snapnote-logs`，并记录进程以便安全关闭。
+
+关闭服务：
+
+```powershell
+.\stop.ps1
+```
 
 依赖已经安装时，可以减少检查步骤：
 
@@ -152,7 +163,7 @@ conda activate snapnote
 cd backend
 pip install -r requirements.txt
 Copy-Item .env.example .env
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8001
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 43872
 ```
 
 前端需要在另一个终端中启动：
@@ -162,8 +173,8 @@ cd frontend
 npm.cmd install
 Copy-Item .env.example .env.local
 # 将 .env.local 中的地址设置为：
-# NEXT_PUBLIC_API_BASE_URL=http://localhost:8001
-npm.cmd run dev
+# NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:43872
+npm.cmd run dev -- --host 127.0.0.1 --port 43871
 ```
 
 如果只想体验界面，将 `NEXT_PUBLIC_API_BASE_URL` 留空即可进入浏览器演示模式。
@@ -172,7 +183,7 @@ npm.cmd run dev
 
 ## 快速开始
 
-安装完成后打开 `http://localhost:3000`：
+安装完成后打开 `http://127.0.0.1:43871`：
 
 1. 上传一个 PPT 或录屏视频；
 2. 选择识别方案和“课堂笔记 / 会议笔记”；
@@ -183,7 +194,7 @@ npm.cmd run dev
 检查后端是否正常：
 
 ```powershell
-Invoke-RestMethod http://localhost:8001/api/health
+Invoke-RestMethod http://127.0.0.1:43872/api/health
 ```
 
 预期响应：
@@ -343,7 +354,7 @@ flowchart LR
 
 ## API 接口
 
-启动后可访问 `http://localhost:8001/docs` 查看 OpenAPI 文档。
+启动后可访问 `http://127.0.0.1:43872/docs` 查看 OpenAPI 文档。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -360,7 +371,7 @@ flowchart LR
 上传示例：
 
 ```bash
-curl -X POST "http://localhost:8001/api/snapnote/tasks" \
+curl -X POST "http://127.0.0.1:43872/api/snapnote/tasks" \
   -F "video=@lecture.mp4" \
   -F "asr_provider=whisper" \
   -F "note_style=classroom"
@@ -418,13 +429,16 @@ SnapNote/
 │   │   ├── components/          # 品牌导航与画面预览组件
 │   │   └── lib/                 # 后端客户端与本地演示数据
 │   ├── tests/                   # Worker 服务端渲染测试
-│   ├── worker/                  # Cloudflare Worker 入口
+│   ├── worker/                  # Vinext 本地 Worker 运行入口
 │   ├── public/                  # 图标与 Open Graph 资源
-│   └── .openai/hosting.json     # Sites 项目标识和逻辑绑定
+│   └── tests/                   # 本地渲染测试
 ├── docs/images/                 # README 主视觉
 ├── storage/                     # SQLite 与任务文件，运行时生成且不提交
 ├── SnapNote_Web_Demo_PRD_v1.md  # Web Demo 产品需求
-├── start.ps1                    # Windows 一键启动
+├── start-snapnote.cmd           # Windows 双击启动
+├── stop-snapnote.cmd            # Windows 双击关闭
+├── start.ps1                    # 一键启动核心脚本
+├── stop.ps1                     # 按记录安全关闭前后端
 └── README.md
 ```
 
@@ -436,7 +450,7 @@ SnapNote/
 
 | 配置项 | 必需 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `FRONTEND_ORIGIN` | 否 | `http://localhost:3000` | 允许跨域访问的前端地址 |
+| `FRONTEND_ORIGIN` | 否 | `http://127.0.0.1:43871` | 允许跨域访问的前端地址 |
 | `STORAGE_ROOT` | 否 | 项目内 `storage` | 数据库和任务目录 |
 | `DATABASE_URL` | 否 | SQLite async URL | 可覆盖数据库连接 |
 | `MAX_UPLOAD_SIZE_MB` | 否 | `2048` | 上传大小上限 |
@@ -456,7 +470,7 @@ SnapNote/
 
 | 配置项 | 必需 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `NEXT_PUBLIC_API_BASE_URL` | 否 | 空 | 空值使用浏览器演示模式；真实模式填写 `http://localhost:8001` |
+| `NEXT_PUBLIC_API_BASE_URL` | 否 | 空 | 空值使用浏览器演示模式；真实模式填写 `http://127.0.0.1:43872` |
 
 > [!CAUTION]
 > API Key 只应保存在 `backend/.env`，不要提交到 Git，也不要写入任何 `NEXT_PUBLIC_*` 变量。
@@ -553,7 +567,7 @@ conda run -n snapnote python -c "from app.main import app; print(app.title)"
 
 ### 为什么在线 Demo 上传后没有真正调用 Whisper？
 
-公开站点默认是浏览器演示模式，目的是无需上传服务即可体验完整产品交互。请按安装章节启动本地后端，并配置 `NEXT_PUBLIC_API_BASE_URL=http://localhost:8001`。
+公开站点默认是浏览器演示模式，目的是无需上传服务即可体验完整产品交互。请按安装章节启动本地后端，并配置 `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:43872`。
 
 ### 为什么启用了真实后端，转写仍显示为演示内容？
 

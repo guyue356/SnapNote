@@ -11,7 +11,7 @@ load_dotenv(BACKEND_DIR / ".env")
 STORAGE_ROOT = Path(os.getenv("STORAGE_ROOT", PROJECT_DIR / "storage")).resolve()
 TASKS_DIR = STORAGE_ROOT / "tasks"
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite+aiosqlite:///{STORAGE_ROOT / 'app.db'}")
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://127.0.0.1:43871")
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "2048"))
 MAX_VIDEO_DURATION_SECONDS = int(os.getenv("MAX_VIDEO_DURATION_SECONDS", "3600"))
 
