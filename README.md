@@ -4,9 +4,9 @@
 
 # SnapNote
 
-> 自动把课程与会议视频整理成带关键画面、时间锚点和复习问题的结构化图文笔记。
+> 用低成本精确 ASR、本地智能抽帧和 MiMo v2.5，把长视频变成可检索笔记、视觉风格画像与分镜分析。
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-7147e8?style=flat-square)](./LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-7147e8?style=flat-square)](./LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-22.13+-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
@@ -20,12 +20,12 @@
 
 ## 项目简介
 
-课堂录屏、技术培训和 PPT 型会议通常包含两条同等重要的信息线：讲解者说了什么，以及屏幕上正在展示什么。纯语音转写只能保留前者，用户复习时仍需在视频、截图和文字之间反复切换。
+视频通常包含两条同等重要的信息线：说了什么，以及画面如何表达。纯语音转写只能保留前者；把原始长视频直接交给视觉大模型又会产生不必要的 Token 和等待时间。
 
-SnapNote 将视频中的关键画面、带时间戳的语音片段和结构化总结绑定在同一条时间线上。用户可以按 PPT 页面浏览摘要与知识点，点击画面或时间标签直接回到视频原位置，并将结果导出为 Markdown。项目面向学生、研究人员、职场学习者与内容整理者，当前优先优化录屏、在线课程、培训和稳定机位拍摄的 PPT 视频。
+SnapNote 采用混合路线：本机 `faster-whisper` 负责低成本精确 ASR，本地算法完成镜头检测与关键帧质量择优，MiMo v2.5 只理解筛选后的多图和少量动态短片。结果把镜头、转写、视觉语义、内容风格和 storyboard 绑定到同一时间线，可用于课程/会议笔记，也可扩展到长视频批量分析、爆款素材风格学习和分镜研究。
 
 > [!IMPORTANT]
-> 项目当前以本地运行作为主要使用方式。真实视频解析、ffmpeg 抽帧、本地 Whisper、OCR 和 DeepSeek 增强由本地 FastAPI 后端完成。
+> 项目当前以本地运行作为主要使用方式。原视频、ASR 权重和中间产物保存在本机；只有筛选后的关键帧、动态代理片段及其上下文会按配置发送给 MiMo。
 
 ---
 
@@ -33,7 +33,7 @@ SnapNote 将视频中的关键画面、带时间戳的语音片段和结构化�
 
 ### 1. 关键画面与讲解自动绑定
 
-后端使用 ffprobe 读取视频元信息，使用 ffmpeg 标准化音频并按时间间隔提取候选帧，再通过 pHash 去除高度相似页面。关键画面最终与相邻转写片段按时间窗口对齐，避免笔记退化为脱离视觉上下文的纯文本。
+后端使用 ffprobe 读取视频元信息，使用 ffmpeg 流式低分辨率解码；NumPy 检测场景变化并计算清晰度、亮度、对比度、稳定性和运动强度。每个镜头择优提取一张代表帧，再通过 pHash 去重并与相邻转写对齐。
 
 ### 2. 可回看的视频图文笔记
 
@@ -41,11 +41,11 @@ SnapNote 将视频中的关键画面、带时间戳的语音片段和结构化�
 
 ### 3. 可解释的长任务进度
 
-处理过程被拆分为上传、解析、音频提取、转写、抽帧、去重、OCR、对齐、摘要和完整笔记生成等阶段。后端通过 SSE 推送事件并保留近期事件历史，前端在刷新后仍可恢复任务状态。
+处理过程覆盖上传、解析、音频、ASR、镜头检测、质量择优、去重、OCR、MiMo 多图、动态代理、整片风格、对齐和结果生成。后端通过 SSE 推送事件并保留近期事件历史，前端刷新后仍可恢复任务状态。
 
-### 4. 可选 AI Provider 与确定性降级
+### 4. 分层多模态 Provider 与确定性降级
 
-本地可选启用 `faster-whisper` 和 PaddleOCR；配置 DeepSeek 后可对逐页笔记执行结构化增强。未安装重型模型或 LLM 调用失败时，流水线会保留已有产物并使用本地规则生成可展示结果。
+ASR 可在本机 Whisper 与 MIMO-ASR 间选择；视觉统一使用 `mimo-v2.5`，并与 MIMO-ASR 复用同一 Token Plan Key。本地 OCR 与 DeepSeek 润色保持可选；视觉调用失败时默认保留本地镜头与转写结果，也可开启严格失败模式。
 
 ### 5. 双运行模式
 
@@ -66,17 +66,17 @@ SnapNote 将视频中的关键画面、带时间戳的语音片段和结构化�
 
 1. 拖入 MP4、MOV 或 WebM 视频；
 2. 选择识别方案与笔记类型；
-3. 查看 11 阶段处理时间线；
+3. 查看 15 阶段处理时间线；
 4. 在结果页体验视频跳转、章节导航、OCR 折叠和 Markdown 导出。
 
 ### 输入与输出
 
 | 输入 | 输出 |
 | --- | --- |
-| PPT 录屏、在线课程、培训或屏幕共享视频 | 视频标题、时长与生成信息 |
+| 课程、会议、访谈、产品、剧情、短视频或屏幕录制 | 视频标题、时长与生成信息 |
 | MP4 / MOV / WebM | 总体摘要与章节目录 |
-| 中文优先，兼容 Whisper 支持的其他语言 | 按关键画面组织的逐页笔记 |
-| 建议 60 分钟以内、PPT 占据主要画面 | 时间锚点、OCR、知识点与复习问题 |
+| 中文优先，兼容 Whisper 支持的其他语言 | 按镜头组织的图文笔记与原始转写 |
+| 建议 60 分钟以内 | 时间锚点、视觉语义、风格、爆款元素与 storyboard |
 | 至少包含一路可识别音频 | 原始转写与 Markdown 文件 |
 
 ---
@@ -87,8 +87,9 @@ SnapNote 将视频中的关键画面、带时间戳的语音片段和结构化�
 - **职场学习者**：把培训、技术分享和行业会议转为可检索、可回看的结构化资料。
 - **产品与项目团队**：从 PPT 会议中提取页面结论、讲解片段和后续复习问题。
 - **内容整理者**：将长视频转换为文章、课程纪要或知识库素材的初稿。
+- **内容创作者与研究者**：批量提取视频的开场钩子、构图、运镜、节奏、剪辑模式与逐镜头 storyboard。
 
-当前 Demo 不优先处理手持镜头、白板手写、多机位频繁转场、PPT 占比过小或需要复杂说话人分离的内容。
+当前版本不提供说话人分离，也不会把整条原视频逐秒上传给 MiMo；复杂动作只在动态/不确定镜头的短代理中补充分析。
 
 ---
 
@@ -239,15 +240,17 @@ flowchart TD
     API --> Files["本地任务文件"]
     API --> Pipeline["多模态处理流水线"]
 
-    Pipeline --> Media["ffprobe 与 ffmpeg"]
-    Pipeline --> ASR["faster-whisper 可选"]
+    Pipeline --> Media["ffprobe / ffmpeg / NumPy"]
+    Pipeline --> ASR["faster-whisper 或 MIMO-ASR"]
     Pipeline --> OCR["PaddleOCR 可选"]
-    Pipeline --> LLM["DeepSeek 可选"]
+    Pipeline --> MIMO["MiMo v2.5 多模态"]
 
-    Media --> Align["图文时间对齐"]
+    Media --> Frames["镜头检测与质量择优"]
+    Frames --> MIMO
+    MIMO --> Align["多模态时间对齐"]
     ASR --> Align
     OCR --> Align
-    Align --> Notes["逐页笔记与 Markdown"]
+    Align --> Notes["分镜画像、笔记与 Markdown"]
     Notes --> DB
     Notes --> Web
 ```
@@ -256,10 +259,10 @@ flowchart TD
 | --- | --- |
 | Vinext Web | 上传、任务列表、实时进度、播放器与笔记联动、导出入口 |
 | FastAPI | 文件校验、任务 API、SSE、视频与 Markdown 文件响应 |
-| Pipeline | 视频解析、音频、转写、抽帧、去重、OCR、对齐和笔记生成 |
+| Pipeline | 视频解析、ASR、镜头检测、关键帧择优、动态代理、MiMo 理解、对齐和结果生成 |
 | SQLAlchemy async | 保存任务状态、阶段历史和最终产物索引 |
 | 本地文件系统 | 按 UUID 隔离存储原视频、音频、关键帧和导出文件 |
-| Provider 层 | 按环境能力启用 Whisper、PaddleOCR 和 DeepSeek，失败时降级 |
+| Provider 层 | Whisper / MIMO-ASR 双转写；MiMo v2.5 图片、视频与结构化输出复用同一 API Key |
 
 ---
 
@@ -270,14 +273,18 @@ flowchart LR
     Upload["上传视频"] --> Probe["解析元信息"]
     Probe --> Audio["提取音频"]
     Audio --> ASR["带时间戳转写"]
-    Probe --> Frames["按时间提取画面"]
+    Probe --> Scan["2 fps 流式场景扫描"]
+    Scan --> Frames["镜头内画质择优"]
     Frames --> Dedup["pHash 去重"]
-    Dedup --> OCR["OCR 识别"]
-    ASR --> Align["时间窗口对齐"]
-    OCR --> Align
-    Align --> Blocks["逐页笔记块"]
-    Blocks --> Enhance["LLM 可选增强"]
-    Enhance --> Markdown["Markdown 输出"]
+    Dedup --> Images["MiMo 多图批量理解"]
+    Images --> Decision{"动态或不确定？"}
+    Decision -->|"是"| Proxy["无声短视频代理"]
+    Proxy --> VideoAI["MiMo 视频理解"]
+    Decision -->|"否"| Align["多模态时间对齐"]
+    VideoAI --> Align
+    ASR --> Align
+    Align --> Profile["风格 / 叙事 / 爆款 / 分镜画像"]
+    Profile --> Markdown["结构化 JSON 与 Markdown"]
 ```
 
 后端按以下阶段写入进度并发送 SSE：
@@ -285,16 +292,19 @@ flowchart LR
 | 阶段 | 默认进度 | 主要产物 |
 | --- | ---: | --- |
 | `upload_complete` | 3% | 原始视频与任务记录 |
-| `probing_video` | 8% | 时长、分辨率、编码信息 |
-| `extracting_audio` | 16% | 16kHz 单声道 WAV |
-| `transcribing` | 32% | 带开始/结束时间的转写片段 |
-| `detecting_frames` | 45% | 候选关键画面 |
-| `selecting_frames` | 55% | 稳定画面集合 |
-| `deduplicating_frames` | 62% | pHash 去重后的关键帧 |
-| `running_ocr` | 72% | 页面 OCR 文字 |
-| `aligning` | 82% | 画面与讲解的时间对齐结果 |
-| `generating_blocks` | 91% | 标题、摘要、知识点和问题 |
-| `generating_note` | 97% | 完整 Markdown |
+| `probing_video` | 6% | 时长、分辨率、编码信息 |
+| `extracting_audio` | 12% | 16kHz 单声道 WAV |
+| `transcribing` | 28% | 带开始/结束时间的转写片段 |
+| `detecting_frames` | 38% | 场景边界、运动与画质采样 |
+| `selecting_frames` | 46% | 每个镜头的代表帧 |
+| `deduplicating_frames` | 51% | pHash 去重后的关键帧 |
+| `running_ocr` | 56% | 可选本地 OCR 文字 |
+| `understanding_frames` | 68% | MiMo 多图视觉语义 |
+| `understanding_clips` | 76% | 动态片段的动作、运镜和转场 |
+| `analyzing_style` | 84% | 整片叙事、风格、爆款与分镜画像 |
+| `aligning` | 89% | 镜头、视觉语义和转写对齐结果 |
+| `generating_blocks` | 94% | 逐镜头结构化内容 |
+| `generating_note` | 98% | 完整 Markdown 与分析 JSON |
 | `complete` | 100% | 可浏览与导出的任务结果 |
 
 ---
@@ -305,10 +315,25 @@ SnapNote 当前采用确定性的流水线编排，不是多 Agent 系统，也�
 
 ### ASR
 
-- 设置 `ENABLE_LOCAL_WHISPER=1` 后，后端加载 `faster-whisper`，以 CPU `int8` 模式生成带时间戳的片段。
-- `WHISPER_MODEL_SIZE` 和 `WHISPER_LANGUAGE` 控制模型与语言。
-- 未启用 Whisper 或音频不可用时，当前版本使用演示转写保证产品闭环可展示。
-- 前端已提供 MIMO-ASR 选项，`MIMO_API_KEY` 也预留在配置中，但当前代码尚未实现真实 MIMO 请求适配器。
+- 默认使用 `faster-whisper large-v3`，自动检测 CUDA；CUDA 使用 `int8_float16`，否则回退到 CPU `int8`。
+- Whisper 显式复用当前用户的 Hugging Face 权重缓存；可通过 `WHISPER_CACHE_DIR` 指定已有缓存目录。
+- Whisper 使用 VAD、词级时间戳和重复幻觉片段过滤，处理过程中持续发送分段进度。
+- 选择 MIMO-ASR 后，系统把 WAV 转为 90 秒、32k 的 MP3 分片，最多并发 3 个请求，并提供请求级重试、心跳和可选串行 fallback。
+- 两种 Provider 都返回统一的 `start`、`end`、`text` 分段结构。真实 ASR 不可用或返回空结果时任务会明确失败，不再生成演示转写。
+
+### 本地镜头检测与关键帧
+
+- ffmpeg 以默认 2 fps、320×320 灰度帧流式解码，不把整段视频载入内存，也不落盘全部采样帧。
+- NumPy 同时计算直方图变化、像素运动、拉普拉斯清晰度、亮度、对比度与稳定性；场景突变或镜头过长都会建立新镜头。
+- 每个镜头选择综合质量最高且避开转场瞬间的代表帧，再按全片时间桶控制覆盖度和 `FRAME_MAX_COUNT`，最后用 pHash 去重。
+
+### MiMo v2.5 多模态理解
+
+- 关键帧缩放到 736px 宽后按默认 8 张一批，以 Base64 多图输入调用 `mimo-v2.5`；同一请求附带镜头时间、局部画质指标和对应 ASR 文本。
+- 输出使用 JSON 模式并校验每个 `frame_id`，得到主体、场景、动作、字幕、构图、运镜、光线、配色、风格标签、视觉钩子和置信度。
+- 本地运动分数较高或模型判断静态帧信息不足时，系统生成最长 8 秒、无音轨、低码率的临时 MP4，以 2 fps 送入视频理解；调用结束立即清理代理文件。
+- 最后再做一次文本级整片归纳，输出内容类型、受众、叙事结构、节奏、视觉/剪辑风格、爆款元素、逐镜头 storyboard 和改进建议，持久化在 `visual_analysis_json`。
+- `ENABLE_MIMO_VISION=1` 但调用失败时默认保留本地结果；设置 `MIMO_VISION_REQUIRED=1` 可改为严格失败，避免批量分析静默降级。
 
 ### OCR
 
@@ -331,7 +356,7 @@ flowchart LR
 
 ### 当前算法边界
 
-当前关键帧实现是“按配置间隔抽帧 + pHash 去重”，尚未接入 PRD 中规划的 PySceneDetect、自适应场景变化检测、运动稳定性评分和亮度/清晰度综合择优。README 将这部分列入 Roadmap，而不作为已实现能力描述。
+动态片段只覆盖本地运动较强或 MiMo 标记为需要时序上下文的镜头，以此控制 Token 与耗时；因此它不是对原视频逐秒进行云端完整视频理解。当前任务仍在 FastAPI 进程内执行，批量生产环境应进一步迁移到独立任务队列。
 
 ---
 
@@ -345,9 +370,10 @@ flowchart LR
 | ORM | SQLAlchemy 2 async、aiosqlite | 任务与阶段结果持久化 | 单机 Demo 无需独立数据库服务 |
 | 实时通信 | SSE / `sse-starlette` | 处理阶段与心跳推送 | 单向进度流比 WebSocket 更简单 |
 | 媒体处理 | ffmpeg、ffprobe | 元信息、音频与关键帧 | 格式支持成熟，命令行集成稳定 |
-| ASR | faster-whisper 可选 | 带时间戳语音识别 | CPU `int8` 可在本地运行 |
-| 图像 | Pillow、ImageHash、PaddleOCR 可选 | pHash 去重与页面文字识别 | 适合 PPT 型关键帧处理 |
-| LLM | DeepSeek Chat Completions 可选 | 标题、摘要、知识点和问题增强 | 支持结构化 JSON 输出与本地降级 |
+| ASR | faster-whisper / MIMO-ASR | 带时间戳语音识别 | 本机权重低成本主路径，云端可选 |
+| 视觉算法 | ffmpeg、NumPy、Pillow、ImageHash | 流式场景检测、质量评分与去重 | 无需保存全量采样帧，不限定 PPT 场景 |
+| 视觉模型 | MiMo v2.5 | 多图、短视频、整片风格与分镜理解 | 原生多模态、结构化输出、同一 Token Plan Key |
+| LLM | DeepSeek Chat Completions 可选 | 末端笔记文字润色 | 不参与核心视觉事实提取 |
 | 部署 | Cloudflare Workers / Sites | 公开前端演示 | Worker 兼容 ESM 与边缘分发 |
 
 ---
@@ -397,7 +423,7 @@ curl -X POST "http://127.0.0.1:43872/api/snapnote/tasks" \
 | 标识与文件 | `id`、`filename`、`video_path`、`audio_path` | UUID 任务与本地文件位置 |
 | 状态 | `status`、`current_stage`、`progress`、`error_message` | 生命周期、阶段和错误信息 |
 | 参数 | `asr_provider`、`note_style` | 识别方案与笔记类型 |
-| 产物 | `frames_json`、`transcripts_json`、`notes_json`、`final_markdown` | Demo 阶段以 JSON/文本保存的结果 |
+| 产物 | `frames_json`、`transcripts_json`、`notes_json`、`visual_analysis_json`、`final_markdown` | 关键帧、转写、逐镜头块、整片视觉画像与 Markdown |
 | 时间 | `created_at`、`updated_at` | UTC 创建与更新时间 |
 
 ### `snap_stage_results`
@@ -414,6 +440,9 @@ SnapNote/
 │   ├── app/
 │   │   ├── main.py             # FastAPI 路由、上传、SSE、导出与删除
 │   │   ├── pipeline.py         # 媒体、ASR、OCR、对齐与笔记流水线
+│   │   ├── asr.py              # Whisper/MIMO-ASR Provider、分片、重试与进度
+│   │   ├── vision.py           # 流式镜头检测、质量评分、关键帧与动态代理
+│   │   ├── mimo_vision.py      # MiMo 多图、短视频和整片结构化分析
 │   │   ├── database.py         # SQLAlchemy 异步模型与数据库初始化
 │   │   ├── config.py           # 环境变量、存储和 ffmpeg 探测
 │   │   ├── schemas.py          # API 请求与响应 Schema
@@ -455,15 +484,44 @@ SnapNote/
 | `DATABASE_URL` | 否 | SQLite async URL | 可覆盖数据库连接 |
 | `MAX_UPLOAD_SIZE_MB` | 否 | `2048` | 上传大小上限 |
 | `MAX_VIDEO_DURATION_SECONDS` | 否 | `3600` | 最大处理时长 |
-| `ENABLE_LOCAL_WHISPER` | 否 | `0` | 是否启用本地真实 ASR |
-| `WHISPER_MODEL_SIZE` | 否 | `small` | faster-whisper 模型规格 |
+| `DEFAULT_ASR_PROVIDER` | 否 | `whisper` | 未指定时使用的 ASR Provider |
+| `ENABLE_LOCAL_WHISPER` | 否 | `1` | 是否启用本地 Whisper |
+| `WHISPER_MODEL_SIZE` | 否 | `large-v3` | faster-whisper 模型规格 |
 | `WHISPER_LANGUAGE` | 否 | `zh` | 识别语言；留空可自动检测 |
-| `MIMO_API_KEY` | 否 | 空 | 预留配置，当前尚未接入真实请求 |
+| `WHISPER_DEVICE` | 否 | 自动检测 | 可显式设置 `cpu` 或 `cuda` |
+| `WHISPER_COMPUTE_TYPE` | 否 | 自动选择 | CPU 默认 `int8`，CUDA 默认 `int8_float16` |
+| `WHISPER_CACHE_DIR` | 否 | 当前用户的 Hugging Face Hub 缓存 | 复用已下载的 Whisper 权重 |
+| `MIMO_API_KEY` | 使用 MIMO 时 | 空 | MIMO-ASR 与 MiMo 视觉共用的 API Key |
+| `MIMO_BASE_URL` | 否 | 根据 Key 自动选择 | `tp-` Key 默认使用 Token Plan 地址 |
+| `MIMO_ASR_MODEL` | 否 | `mimo-v2.5-asr` | MIMO-ASR 模型名 |
+| `MIMO_ASR_LANGUAGE` | 否 | `zh` | MIMO-ASR 识别语言 |
+| `MIMO_ASR_CHUNK_SECONDS` | 否 | `90` | MP3 分片目标时长 |
+| `MIMO_ASR_MP3_BITRATE` | 否 | `32k` | 分片码率 |
+| `MIMO_ASR_CONCURRENCY` | 否 | `3` | 最大并发请求数 |
+| `MIMO_ASR_TIMEOUT_SECONDS` | 否 | `90` | 单次请求超时 |
+| `MIMO_ASR_MAX_ATTEMPTS` | 否 | `2` | 临时错误最大请求次数 |
+| `MIMO_ASR_HEARTBEAT_SECONDS` | 否 | `10` | 等待响应时的进度心跳间隔 |
+| `MIMO_ASR_FALLBACK_RETRY` | 否 | `0` | 并发临时失败后是否串行重试 |
+| `ENABLE_MIMO_VISION` | 否 | `1` | 启用 MiMo v2.5 关键帧、动态片段和整片分析 |
+| `MIMO_VISION_REQUIRED` | 否 | `0` | 视觉 API 失败时是否让任务严格失败 |
+| `MIMO_VISION_MODEL` | 否 | `mimo-v2.5` | 图片与视频理解模型名 |
+| `MIMO_VISION_IMAGE_BATCH_SIZE` | 否 | `8` | 每次多图请求的关键帧数量 |
+| `MIMO_VISION_CONCURRENCY` | 否 | `2` | 多图批次最大并发数 |
+| `MIMO_VISION_MAX_CLIPS` | 否 | `4` | 单视频最多补充分析的动态短片数 |
+| `MIMO_VISION_CLIP_SECONDS` | 否 | `8` | 每个动态代理片段最长秒数 |
+| `MIMO_VISION_VIDEO_FPS` | 否 | `2` | MiMo 对代理视频的采样帧率 |
 | `DEEPSEEK_API_KEY` | 否 | 空 | 配置后启用 LLM 笔记增强 |
 | `DEEPSEEK_MODEL` | 否 | `deepseek-chat` | DeepSeek 模型名 |
 | `DEEPSEEK_BASE_URL` | 否 | `https://api.deepseek.com/v1` | OpenAI 兼容接口地址 |
 | `FRAME_FALLBACK_INTERVAL_SECONDS` | 否 | `60` | 兜底抽帧间隔 |
-| `FRAME_MAX_COUNT` | 否 | `12` | 单任务最大关键帧数 |
+| `FRAME_MAX_COUNT` | 否 | `24` | 单任务最大关键帧数 |
+| `FRAME_ANALYSIS_FPS` | 否 | `2` | 本地场景扫描帧率 |
+| `FRAME_ANALYSIS_WIDTH` | 否 | `320` | 本地低分辨率分析宽度 |
+| `FRAME_OUTPUT_WIDTH` | 否 | `736` | 关键帧与代理视频输出宽度 |
+| `SCENE_CHANGE_THRESHOLD` | 否 | `0.24` | 场景变化判定阈值 |
+| `SCENE_MIN_DURATION_SECONDS` | 否 | `1.5` | 镜头最短持续时间 |
+| `SCENE_MAX_DURATION_SECONDS` | 否 | `45` | 静态长镜头强制分段时间 |
+| `FRAME_DYNAMIC_THRESHOLD` | 否 | `0.12` | 触发动态代理候选的运动阈值 |
 | `FFMPEG_BIN` / `FFPROBE_BIN` | 否 | 自动查找 | 媒体工具绝对路径 |
 
 ### 前端 `frontend/.env.local`
@@ -479,9 +537,9 @@ SnapNote/
 
 ## 性能与扩展性
 
-- **主要瓶颈**：本地 Whisper、PaddleOCR 和逐帧 ffmpeg 子进程会消耗 CPU、内存与磁盘 I/O。
+- **主要瓶颈**：本地 Whisper、场景扫描解码、PaddleOCR 与 MiMo 请求会消耗 GPU/CPU、网络和 Token。
 - **当前并发模型**：任务通过 FastAPI `BackgroundTasks` 在应用进程内执行，适合单机 Demo，不适合高并发生产环境。
-- **抽帧控制**：按视频时长动态计算间隔，并由 `FRAME_MAX_COUNT` 控制图片数量，避免全帧率扫描。
+- **视觉成本控制**：本地低分辨率扫描免费；只上传最多 24 张 736px 关键帧，并仅给最多 4 个动态/不确定镜头补充无声短视频。
 - **可扩展方向**：将任务编排迁移到独立队列，将 SQLite 升级为 PostgreSQL，将文件迁移到对象存储，并为 ASR/OCR 设置独立工作池。
 - **前端性能**：结果页优先加载关键帧缩略图；在线演示构建为 Cloudflare Worker 兼容 ESM。
 
@@ -516,6 +574,7 @@ npm.cmd test
 cd backend
 conda run -n snapnote python -m compileall -q app
 conda run -n snapnote python -c "from app.main import app; print(app.title)"
+conda run -n snapnote python -m unittest discover -s tests -v
 ```
 
 ---
@@ -523,8 +582,8 @@ conda run -n snapnote python -c "from app.main import app; print(app.title)"
 ## 项目亮点
 
 1. **产品创新**：以“关键画面 + 对应讲解 + 时间锚点”为核心信息单元，而不是把视频简单转换为长转写文本。
-2. **工程降级**：ASR、OCR 和 LLM 都允许缺失或失败，已经完成的媒体与对齐结果不会因此丢失。
-3. **可诊断流水线**：阶段状态、进度、摘要与 JSON 产物均可记录，便于调参和演进到单阶段重试。
+2. **混合成本路线**：本地精确 ASR 与场景算法负责高频工作，MiMo 只处理筛选后的信息密集素材。
+3. **非 PPT 限定的视觉画像**：真实识别人物、动作、运镜、构图、剪辑节奏、爆款元素与 storyboard。
 4. **双模式交付**：同一套前端既可作为无需服务端的产品 Demo，也能连接本地多模态后端处理真实视频。
 5. **边缘友好前端**：Vinext 输出 Cloudflare Worker 兼容构建，同时保留 React App Router 的开发方式。
 
@@ -534,13 +593,16 @@ conda run -n snapnote python -c "from app.main import app; print(app.title)"
 
 - [x] 视频拖拽上传、进度与历史任务
 - [x] ffprobe 元信息和 ffmpeg 音频/关键帧提取
-- [x] 可选 faster-whisper、PaddleOCR 与 DeepSeek 增强
+- [x] faster-whisper large-v3 与 MIMO-ASR 双转写通道
+- [x] MIMO-ASR MP3 分片、并发、重试和进度心跳
+- [x] 流式自适应场景变化检测与镜头内关键帧质量择优
+- [x] MiMo v2.5 多图批量理解与结构化 JSON 校验
+- [x] 动态/不确定镜头的无声短视频代理与视频理解
+- [x] 整片风格、叙事结构、爆款元素与 storyboard 画像
+- [x] 可选 PaddleOCR 与 DeepSeek 增强
 - [x] pHash 去重、时间窗口对齐和 Markdown 导出
 - [x] 视频播放器、章节与笔记时间锚点联动
 - [x] 公开在线前端演示
-- [ ] 实现真实 MIMO-ASR Provider
-- [ ] 接入 PySceneDetect 与自适应场景变化检测
-- [ ] 增加清晰度、亮度、运动稳定性综合评分
 - [ ] 支持单帧删除、重复页面合并和标题编辑
 - [ ] 支持单阶段 OCR / ASR / 笔记重新执行
 - [ ] 引入独立任务队列、对象存储和 PostgreSQL
@@ -569,13 +631,13 @@ conda run -n snapnote python -c "from app.main import app; print(app.title)"
 
 公开站点默认是浏览器演示模式，目的是无需上传服务即可体验完整产品交互。请按安装章节启动本地后端，并配置 `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:43872`。
 
-### 为什么启用了真实后端，转写仍显示为演示内容？
+### 为什么 Whisper 任务启动后提示模型不可用？
 
-默认 `ENABLE_LOCAL_WHISPER=0`，并且 `faster-whisper` 属于可选重型依赖。安装该依赖、将开关设为 `1`，然后重启后端。
+确认已重新执行 `pip install -r backend/requirements.txt`，并保持 `ENABLE_LOCAL_WHISPER=1`。首次运行 `large-v3` 还需要下载模型文件；也可以通过 `WHISPER_DEVICE=cpu` 强制使用 CPU。
 
 ### 选择 MIMO-ASR 会调用 MIMO 服务吗？
 
-当前不会。UI 和配置已经为 Provider 切换预留接口，但真实 MIMO 请求适配器仍在 Roadmap 中。需要真实转写时请先使用本地 Whisper。
+会。后端会读取 `MIMO_API_KEY`，将音频压缩分片后调用 `mimo-v2.5-asr`。缺少 Key、请求失败或返回空转写时，任务会进入失败状态并显示具体原因。
 
 ### PaddleOCR 安装失败会导致任务失败吗？
 
@@ -593,7 +655,12 @@ conda run -n snapnote python -c "from app.main import app; print(app.title)"
 
 ## License
 
-本项目基于 [MIT License](./LICENSE) 开源。你可以使用、复制、修改、合并、发布和分发本项目，但需要保留原始版权与许可声明。
+本项目基于 [Apache License 2.0](./LICENSE) 开源。你可以使用、复制、修改、合并、发布和分发本项目，但需要保留原始版权与许可声明，并在你的项目中注明原作者和来源。
+
+**署名要求**：如果你使用或修改本项目，请在你的 README 或文档中注明：
+> 本项目基于 [SnapNote](https://github.com/guyue356/SnapNote) 开发，原作者 guyue356，采用 [Apache License 2.0](http://www.apache.org/licenses/LICENSE-2.0) 许可。
+
+详细署名要求请参见 [NOTICE](./NOTICE) 文件。
 
 ---
 

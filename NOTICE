@@ -1,0 +1,50 @@
+SnapNote
+Copyright 2026 guyue356
+
+This product is licensed under the Apache License, Version 2.0.
+
+Project: SnapNote - Convert videos into searchable image-text notes
+Author: guyue356
+Repository: https://github.com/guyue356/SnapNote
+
+---
+
+署名要求 (Attribution Requirements)
+
+如果你使用、修改或分发本项目，请在你的项目中包含以下署名信息：
+
+1. 在你的 README 或文档中注明：
+
+   > 本项目基于 [SnapNote](https://github.com/guyue356/SnapNote) 开发，原作者 guyue356，
+   > 采用 [Apache License 2.0](http://www.apache.org/licenses/LICENSE-2.0) 许可。
+
+2. 如果修改了代码，请注明修改内容：
+
+   > 基于 SnapNote (https://github.com/guyue356/SnapNote) 修改，原作者 guyue356。
+
+3. 在你的 LICENSE 或 NOTICE 文件中保留本文件的版权声明。
+
+---
+
+Third-Party Licenses
+
+This project uses the following third-party libraries:
+
+Frontend:
+- React (MIT License)
+- Vinext (MIT License)
+- Tailwind CSS (MIT License)
+- TypeScript (Apache License 2.0)
+
+Backend:
+- FastAPI (MIT License)
+- SQLAlchemy (MIT License)
+- faster-whisper (MIT License)
+- NumPy (BSD License)
+- Pillow (MIT-CMU License)
+- Uvicorn (BSD License)
+
+AI Services:
+- MiMo v2.5 (MIMO API Terms)
+- MIMO-ASR (MIMO API Terms)
+- DeepSeek (DeepSeek API Terms)
