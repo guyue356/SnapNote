@@ -31,7 +31,7 @@ export default function ProcessingPage() {
       };
       refresh();
       const stream = new EventSource(`${API_BASE}/api/snapnote/tasks/${params.id}/stream`);
-      const names = ["upload_complete", "probing_video", "extracting_audio", "transcribing", "detecting_frames", "selecting_frames", "deduplicating_frames", "running_ocr", "aligning", "generating_blocks", "generating_note", "complete", "step_error"];
+      const names = ["upload_complete", "probing_video", "extracting_audio", "transcribing", "detecting_frames", "selecting_frames", "deduplicating_frames", "running_ocr", "understanding_frames", "understanding_clips", "analyzing_style", "aligning", "generating_blocks", "generating_note", "complete", "step_error"];
       const handler = () => refresh();
       names.forEach((name) => stream.addEventListener(name, handler));
       return () => { active = false; stream.close(); window.clearInterval(clock); };

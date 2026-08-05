@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from sse_starlette.sse import EventSourceResponse
 
-from .config import FRONTEND_ORIGIN, MAX_UPLOAD_SIZE_MB, STORAGE_ROOT, TASKS_DIR
+from .config import DEFAULT_ASR_PROVIDER, FRONTEND_ORIGIN, MAX_UPLOAD_SIZE_MB, STORAGE_ROOT, TASKS_DIR
 from .database import SnapTask, async_session, init_db
 from .pipeline import reset_task, run_pipeline
 from .schemas import RetryRequest, TaskCreated
@@ -45,6 +45,7 @@ def _task_payload(task: SnapTask):
         "error_message": task.error_message, "frame_count": len(frames), "frames": frames,
         "transcript_segments": json.loads(task.transcripts_json or "[]"),
         "note_blocks": json.loads(task.notes_json or "[]"), "final_markdown": task.final_markdown,
+        "visual_analysis": json.loads(task.visual_analysis_json or "{}"),
         "video_url": f"/api/snapnote/tasks/{task.id}/video", "created_at": task.created_at,
     }
 
@@ -55,7 +56,7 @@ async def health():
 
 
 @app.post("/api/snapnote/tasks", response_model=TaskCreated)
-async def create_task(background_tasks: BackgroundTasks, video: UploadFile = File(...), asr_provider: str = Form("mimo"), note_style: str = Form("classroom")):
+async def create_task(background_tasks: BackgroundTasks, video: UploadFile = File(...), asr_provider: str = Form(DEFAULT_ASR_PROVIDER), note_style: str = Form("classroom")):
     suffix = Path(video.filename or "").suffix.lower()
     if suffix not in {".mp4", ".mov", ".webm"}:
         raise HTTPException(415, "仅支持 MP4、MOV 和 WebM 视频")
@@ -77,7 +78,7 @@ async def create_task(background_tasks: BackgroundTasks, video: UploadFile = Fil
         raise
 
     async with async_session() as db:
-        task = SnapTask(id=task_id, filename=safe_name, video_path=str(video_path), status="queued", current_stage="upload_complete", progress=3, asr_provider=asr_provider if asr_provider in {"mimo", "whisper"} else "mimo", note_style=note_style if note_style in {"classroom", "meeting"} else "classroom")
+        task = SnapTask(id=task_id, filename=safe_name, video_path=str(video_path), status="queued", current_stage="upload_complete", progress=3, asr_provider=asr_provider if asr_provider in {"mimo", "whisper"} else DEFAULT_ASR_PROVIDER, note_style=note_style if note_style in {"classroom", "meeting"} else "classroom")
         db.add(task)
         await db.commit()
     await sse_manager.emit(task_id, "upload_complete", {"stage": "upload_complete", "progress": 3, "title": "上传完成", "message": "视频已安全保存"})

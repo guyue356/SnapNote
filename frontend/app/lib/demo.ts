@@ -20,13 +20,17 @@ export const STAGES = [
   ["上传完成", "视频已安全保存，准备进入处理队列"],
   ["解析视频", "读取时长、分辨率、编码与音轨信息"],
   ["提取音频", "将语音标准化为适合识别的音频格式"],
-  ["语音转写", "生成带开始与结束时间的讲解文本"],
-  ["检测关键画面", "识别 PPT 翻页和明显内容变化"],
-  ["筛选与去重", "过滤模糊帧，合并相似页面"],
-  ["识别页面文字", "提取标题、术语与页面正文"],
-  ["图文时间对齐", "将画面与对应讲解片段自动绑定"],
-  ["生成逐页摘要", "提炼每张画面的讲解重点"],
-  ["生成完整笔记", "组织目录、知识点和复习问题"],
+  ["精确语音转写", "生成带开始与结束时间的语音文本"],
+  ["检测镜头变化", "扫描场景切换、运动强度与画面质量"],
+  ["选择关键帧", "为每个镜头选择清晰稳定的代表画面"],
+  ["关键帧去重", "合并重复或高度相似的视觉素材"],
+  ["本地 OCR", "低成本提取画面中的可见文字"],
+  ["MiMo 关键帧理解", "批量识别主体、场景、构图与视觉风格"],
+  ["MiMo 动态片段理解", "补充动作、运镜、转场和节奏信息"],
+  ["整片风格与分镜", "归纳叙事结构、爆款元素和可复用模式"],
+  ["多模态时间对齐", "绑定镜头、视觉语义与语音转写"],
+  ["生成结构化内容", "生成逐镜头摘要、重点与分析问题"],
+  ["生成完整结果", "组织 Markdown 与整片分析产物"],
   ["处理完成", "你的图文笔记已经准备好"],
 ] as const;
 
@@ -75,8 +79,8 @@ const VIDEO_KEY = "__snapnoteVideoUrls";
 function seededTasks(): SnapTask[] {
   const now = Date.now();
   return [
-    { id: "demo-transformer", title: "Transformer 核心原理与注意力机制", filename: "week-04-transformer.mp4", fileSize: 486000000, duration: 447, status: "completed", progress: 100, stageIndex: 10, asrProvider: "mimo", noteStyle: "classroom", frameCount: 12, createdAt: new Date(now - 86400000).toISOString(), completedAt: new Date(now - 85800000).toISOString() },
-    { id: "demo-product", title: "产品增长实验复盘会", filename: "growth-review.mov", fileSize: 238000000, duration: 2154, status: "completed", progress: 100, stageIndex: 10, asrProvider: "whisper", noteStyle: "meeting", frameCount: 18, createdAt: new Date(now - 172800000).toISOString(), completedAt: new Date(now - 171600000).toISOString() },
+    { id: "demo-transformer", title: "Transformer 核心原理与注意力机制", filename: "week-04-transformer.mp4", fileSize: 486000000, duration: 447, status: "completed", progress: 100, stageIndex: STAGES.length - 1, asrProvider: "mimo", noteStyle: "classroom", frameCount: 12, createdAt: new Date(now - 86400000).toISOString(), completedAt: new Date(now - 85800000).toISOString() },
+    { id: "demo-product", title: "产品增长实验复盘会", filename: "growth-review.mov", fileSize: 238000000, duration: 2154, status: "completed", progress: 100, stageIndex: STAGES.length - 1, asrProvider: "whisper", noteStyle: "meeting", frameCount: 18, createdAt: new Date(now - 172800000).toISOString(), completedAt: new Date(now - 171600000).toISOString() },
   ];
 }
 
@@ -84,7 +88,13 @@ export function getTasks(): SnapTask[] {
   if (typeof window === "undefined") return [];
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return JSON.parse(raw) as SnapTask[];
+    if (raw) {
+      return (JSON.parse(raw) as SnapTask[]).map((task) => (
+        task.status === "completed"
+          ? { ...task, progress: 100, stageIndex: STAGES.length - 1 }
+          : task
+      ));
+    }
   } catch { /* use seeded tasks */ }
   const seeded = seededTasks();
   localStorage.setItem(STORAGE_KEY, JSON.stringify(seeded));

@@ -20,15 +20,16 @@ export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState("");
-  const [asr, setAsr] = useState<"mimo" | "whisper">("mimo");
+  const [asr, setAsr] = useState<"mimo" | "whisper">("whisper");
   const [style, setStyle] = useState<"classroom" | "meeting">("classroom");
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState("");
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
-  const [tasks, setTasks] = useState<SnapTask[]>(() => typeof window === "undefined" ? [] : getTasks());
+  const [tasks, setTasks] = useState<SnapTask[]>([]);
 
   useEffect(() => {
+    setTasks(getTasks());
     if (hasBackend) fetchBackendTasks().then((items) => setTasks(items.map(toLocalTask))).catch(() => undefined);
   }, []);
 
@@ -93,18 +94,18 @@ export default function Home() {
       <section className="hero wrap">
         <div className="hero-copy">
           <div className="eyebrow"><span className="spark">✦</span> AI 视觉笔记工作台</div>
-          <h1>把一小时视频，<br /><span>变成十分钟能复习完</span><br />的图文笔记</h1>
+          <h1>把一小时视频，<br /><span>变成能检索、能复刻</span><br />的多模态素材</h1>
           <p className="hero-lead">
-            自动捕捉 PPT 关键画面，同步整理老师讲解。每条笔记都能一键跳回视频原位置。
+            本机精确转写与智能抽帧控制成本，MiMo 理解镜头、风格、节奏和分镜。每条结果都能跳回视频原位置。
           </p>
           <div className="value-row">
             <div><b>01</b><span>关键画面<br />自动捕捉</span></div>
             <div><b>02</b><span>语音画面<br />精准对齐</span></div>
-            <div><b>03</b><span>结构笔记<br />随时导出</span></div>
+            <div><b>03</b><span>风格分镜<br />结构输出</span></div>
           </div>
           <div className="proof-row">
             <div className="avatar-stack"><i>林</i><i>周</i><i>陈</i><i>+</i></div>
-            <p><strong>让复习回到重点</strong><br />适合课程录屏、培训与 PPT 会议</p>
+            <p><strong>让视频变成可复用素材</strong><br />适合长视频整理、内容研究与爆款分析</p>
           </div>
         </div>
 
@@ -158,11 +159,11 @@ export default function Home() {
               <legend>语音识别</legend>
               <label className={asr === "mimo" ? "selected" : ""}>
                 <input type="radio" name="asr" checked={asr === "mimo"} onChange={() => setAsr("mimo")} />
-                <span><b>MIMO-ASR</b><small>中文更准确</small></span><em>推荐</em>
+                <span><b>MIMO-ASR</b><small>云端中文与方言</small></span>
               </label>
               <label className={asr === "whisper" ? "selected" : ""}>
                 <input type="radio" name="asr" checked={asr === "whisper"} onChange={() => setAsr("whisper")} />
-                <span><b>Whisper</b><small>多语言兼容</small></span>
+                <span><b>Whisper</b><small>复用本机缓存 · 低成本</small></span><em>推荐</em>
               </label>
             </fieldset>
             <fieldset>
@@ -184,7 +185,7 @@ export default function Home() {
           <button className="primary-button" type="button" onClick={startTask} disabled={!file || uploading}>
             <span>{uploading ? "正在上传…" : "开始生成图文笔记"}</span><b>→</b>
           </button>
-          <p className="upload-tip">为获得更好效果，请优先上传画面稳定的录屏、在线课程或 PPT 视频。</p>
+          <p className="upload-tip">支持课程、会议、访谈、产品、剧情、短视频和屏幕录制；动态镜头会自动补充时序理解。</p>
         </div>
       </section>
 

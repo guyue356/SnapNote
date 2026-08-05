@@ -14,6 +14,22 @@ export type BackendNote = {
   ocr_text: string;
   image_url: string;
   confidence: number;
+  visual_analysis?: Record<string, unknown>;
+  clip_analysis?: Record<string, unknown>;
+};
+
+export type BackendVisualAnalysis = {
+  summary?: string;
+  content_type?: string;
+  target_audience?: string;
+  hook?: string;
+  visual_style?: string;
+  editing_style?: string;
+  viral_elements?: string[];
+  recurring_patterns?: string[];
+  recommendations?: string[];
+  storyboard?: Array<{ start_time: number; end_time: number; shot: string; purpose: string }>;
+  provider?: string;
 };
 
 export type BackendTask = {
@@ -31,12 +47,20 @@ export type BackendTask = {
   frames: Array<{ timestamp: number; image_url: string }>;
   transcript_segments: Array<{ start: number; end: number; text: string }>;
   note_blocks: BackendNote[];
+  visual_analysis: BackendVisualAnalysis;
   final_markdown: string;
   video_url: string;
   created_at: string;
 };
 
 export function toLocalTask(task: BackendTask): SnapTask {
+  const stageOrder = [
+    "upload_complete", "probing_video", "extracting_audio", "transcribing",
+    "detecting_frames", "selecting_frames", "deduplicating_frames", "running_ocr",
+    "understanding_frames", "understanding_clips", "analyzing_style", "aligning",
+    "generating_blocks", "generating_note", "complete",
+  ];
+  const remoteStage = stageOrder.indexOf(task.current_stage);
   return {
     id: task.id,
     title: task.title || task.filename.replace(/\.[^.]+$/, ""),
@@ -45,7 +69,7 @@ export function toLocalTask(task: BackendTask): SnapTask {
     duration: task.duration,
     status: task.status === "completed" ? "completed" : task.status === "failed" ? "failed" : "processing",
     progress: task.progress,
-    stageIndex: Math.min(10, Math.floor(task.progress / 9.1)),
+    stageIndex: remoteStage >= 0 ? remoteStage : Math.min(stageOrder.length - 1, Math.floor(task.progress / (100 / stageOrder.length))),
     asrProvider: task.asr_provider,
     noteStyle: task.note_style,
     frameCount: task.frame_count,

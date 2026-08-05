@@ -12,7 +12,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=111)](https://react.dev/)
 
-[本地启动](#方式二windows-一键启动) · [产品需求文档](./SnapNote_Web_Demo_PRD_v1.md) · [API 文档](#api-接口)
+[本地启动](#方式二windows-一键启动) · [产品 PRD](./PRD/SnapNote_PRD_v1.md) · [Web Demo PRD](./PRD/SnapNote_Web_Demo_PRD_v1.md) · [API 文档](#api-接口)
 
 </div>
 
@@ -186,7 +186,7 @@ npm.cmd run dev -- --host 127.0.0.1 --port 43871
 
 安装完成后打开 `http://127.0.0.1:43871`：
 
-1. 上传一个 PPT 或录屏视频；
+1. 上传一个 MP4、MOV 或 WebM 视频；
 2. 选择识别方案和“课堂笔记 / 会议笔记”；
 3. 点击“开始生成图文笔记”；
 4. 等待任务完成后，从画面或时间标签跳回视频；
@@ -224,7 +224,7 @@ Invoke-RestMethod http://127.0.0.1:43872/api/health
 - 文件格式：`.mp4`、`.mov`、`.webm`
 - 默认最大文件：2048 MB
 - 默认最大处理时长：3600 秒
-- 推荐内容：录屏、在线课程、PPT 画面稳定的视频
+- 推荐内容：课程、会议、访谈、产品、剧情、短视频或屏幕录制
 
 ---
 
@@ -447,6 +447,7 @@ SnapNote/
 │   │   ├── config.py           # 环境变量、存储和 ffmpeg 探测
 │   │   ├── schemas.py          # API 请求与响应 Schema
 │   │   └── sse_manager.py      # 订阅者队列与近期事件历史
+│   ├── tests/                   # ASR、镜头算法与 MiMo 结构化输出测试
 │   ├── .env.example            # 后端配置模板
 │   └── requirements.txt        # Python 依赖
 ├── frontend/
@@ -457,13 +458,15 @@ SnapNote/
 │   │   │                         # 处理时间线与实时事件
 │   │   ├── components/          # 品牌导航与画面预览组件
 │   │   └── lib/                 # 后端客户端与本地演示数据
-│   ├── tests/                   # Worker 服务端渲染测试
 │   ├── worker/                  # Vinext 本地 Worker 运行入口
 │   ├── public/                  # 图标与 Open Graph 资源
-│   └── tests/                   # 本地渲染测试
+│   └── tests/                   # Worker 服务端渲染与产品文案测试
 ├── docs/images/                 # README 主视觉
+├── PRD/
+│   ├── SnapNote_PRD_v1.md       # 产品需求文档
+│   └── SnapNote_Web_Demo_PRD_v1.md
+│                                 # Web Demo 产品需求文档
 ├── storage/                     # SQLite 与任务文件，运行时生成且不提交
-├── SnapNote_Web_Demo_PRD_v1.md  # Web Demo 产品需求
 ├── start-snapnote.cmd           # Windows 双击启动
 ├── stop-snapnote.cmd            # Windows 双击关闭
 ├── start.ps1                    # 一键启动核心脚本
@@ -507,6 +510,8 @@ SnapNote/
 | `MIMO_VISION_MODEL` | 否 | `mimo-v2.5` | 图片与视频理解模型名 |
 | `MIMO_VISION_IMAGE_BATCH_SIZE` | 否 | `8` | 每次多图请求的关键帧数量 |
 | `MIMO_VISION_CONCURRENCY` | 否 | `2` | 多图批次最大并发数 |
+| `MIMO_VISION_TIMEOUT_SECONDS` | 否 | `180` | 单次视觉请求超时 |
+| `MIMO_VISION_MAX_ATTEMPTS` | 否 | `3` | 视觉请求最大尝试次数 |
 | `MIMO_VISION_MAX_CLIPS` | 否 | `4` | 单视频最多补充分析的动态短片数 |
 | `MIMO_VISION_CLIP_SECONDS` | 否 | `8` | 每个动态代理片段最长秒数 |
 | `MIMO_VISION_VIDEO_FPS` | 否 | `2` | MiMo 对代理视频的采样帧率 |
@@ -522,6 +527,7 @@ SnapNote/
 | `SCENE_MIN_DURATION_SECONDS` | 否 | `1.5` | 镜头最短持续时间 |
 | `SCENE_MAX_DURATION_SECONDS` | 否 | `45` | 静态长镜头强制分段时间 |
 | `FRAME_DYNAMIC_THRESHOLD` | 否 | `0.12` | 触发动态代理候选的运动阈值 |
+| `FRAME_PHASH_THRESHOLD` | 否 | `6` | 关键帧感知哈希去重阈值 |
 | `FFMPEG_BIN` / `FFPROBE_BIN` | 否 | 自动查找 | 媒体工具绝对路径 |
 
 ### 前端 `frontend/.env.local`

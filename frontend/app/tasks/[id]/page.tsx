@@ -6,7 +6,7 @@ import { useParams, useRouter } from "next/navigation";
 import BrandHeader from "../../components/BrandHeader";
 import SlideVisual from "../../components/SlideVisual";
 import { exportMarkdown, formatDuration, getTask, getVideoUrl, SAMPLE_NOTES, saveTask, type SnapTask } from "../../lib/demo";
-import { API_BASE, backendAsset, fetchBackendTask, hasBackend, toLocalTask } from "../../lib/api";
+import { API_BASE, backendAsset, fetchBackendTask, hasBackend, toLocalTask, type BackendVisualAnalysis } from "../../lib/api";
 
 type NoteView = {
   time: number;
@@ -32,12 +32,16 @@ export default function ResultPage() {
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
   const [copied, setCopied] = useState(false);
   const [notes, setNotes] = useState<NoteView[]>(SAMPLE_NOTES.map((note) => ({ ...note })));
+  const [visualAnalysis, setVisualAnalysis] = useState<BackendVisualAnalysis>({});
+  const [transcript, setTranscript] = useState<Array<{ start: number; end: number; text: string }>>([]);
 
   useEffect(() => {
     if (hasBackend) {
       fetchBackendTask(params.id).then((remote) => {
         setTask(toLocalTask(remote));
         setVideoUrl(backendAsset(remote.video_url));
+        setVisualAnalysis(remote.visual_analysis || {});
+        setTranscript(remote.transcript_segments || []);
         if (remote.note_blocks.length) {
           setNotes(remote.note_blocks.map((note) => ({
             time: note.timestamp,
@@ -82,7 +86,7 @@ export default function ResultPage() {
   }
 
   async function copySummary() {
-    await navigator.clipboard.writeText("本节课程系统介绍注意力机制、QKV、缩放点积注意力与多头注意力。 ");
+    await navigator.clipboard.writeText(visualAnalysis.summary || "视频已完成多模态分析。");
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1400);
   }
@@ -108,12 +112,12 @@ export default function ResultPage() {
       <section className="result-header wrap">
         <button className="back-link" type="button" onClick={() => router.push("/")}>← 返回处理中心</button>
         <div className="title-actions">
-          <div><div className="result-meta"><span>课堂笔记</span><time>{new Date(task.createdAt).toLocaleDateString("zh-CN")} 生成</time><em>已完成</em></div><h1>{task.title}</h1><p>{formatDuration(task.duration)} · {task.frameCount || 12} 个关键画面 · 中文</p></div>
+          <div><div className="result-meta"><span>{visualAnalysis.content_type || "视频分析"}</span><time>{new Date(task.createdAt).toLocaleDateString("zh-CN")} 生成</time><em>已完成</em></div><h1>{task.title}</h1><p>{formatDuration(task.duration)} · {task.frameCount || 12} 个关键画面 · {visualAnalysis.provider || "多模态流水线"}</p></div>
           <div><button className="secondary-button" type="button" onClick={regenerate}>↻ 重新生成</button><button className="dark-button" type="button" onClick={() => hasBackend ? window.location.assign(`${API_BASE}/api/snapnote/tasks/${task.id}/export/markdown`) : exportMarkdown(task)}>↓ 导出 Markdown</button></div>
         </div>
         <div className="summary-banner">
           <span className="summary-glyph">✦</span>
-          <div><small>AI 总体摘要</small><p>本节课程从注意力机制的动机出发，逐步讲解 Query、Key、Value 的作用，缩放点积注意力的计算过程，以及多头注意力如何并行捕捉不同关系。理解这四个部分，是掌握 Transformer 架构的关键。</p></div>
+          <div><small>AI 总体摘要{visualAnalysis.visual_style ? ` · ${visualAnalysis.visual_style}` : ""}</small><p>{visualAnalysis.summary || "视频已完成镜头、视觉语义与语音内容对齐。"}</p></div>
           <button type="button" onClick={copySummary}>{copied ? "已复制" : "复制"}</button>
         </div>
       </section>
@@ -174,9 +178,9 @@ export default function ResultPage() {
           ) : (
             <div className="transcript-panel">
               <div className="transcript-heading"><div><span>原始转写</span><h2>带时间戳的完整讲解</h2></div><button type="button" onClick={() => exportMarkdown(task)}>↓ 下载文本</button></div>
-              {notes.flatMap((note, index) => [0, 1].map((part) => (
-                <button type="button" key={`${index}-${part}`} onClick={() => seek(note.time + part * 32)}><time>{formatDuration(note.time + part * 32)}</time><p>{part ? `${note.summary} 这里需要特别注意公式中缩放项对训练稳定性的影响。` : note.summary}</p></button>
-              )))}
+              {(transcript.length ? transcript : notes.map((note) => ({ start: note.time, end: note.end, text: note.summary }))).map((segment, index) => (
+                <button type="button" key={`${segment.start}-${index}`} onClick={() => seek(segment.start)}><time>{formatDuration(segment.start)}</time><p>{segment.text}</p></button>
+              ))}
             </div>
           )}
         </div>
