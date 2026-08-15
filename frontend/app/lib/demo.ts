@@ -1,5 +1,15 @@
 export type TaskStatus = "processing" | "completed" | "failed";
 
+export type ProcessingBranchState = {
+  label: string;
+  stage: string;
+  title: string;
+  message: string;
+  progress: number;
+  status: "queued" | "running" | "completed" | "failed" | "skipped";
+  updated_at?: string | null;
+};
+
 export type SnapTask = {
   id: string;
   title: string;
@@ -14,6 +24,8 @@ export type SnapTask = {
   frameCount: number;
   createdAt: string;
   completedAt?: string;
+  errorMessage?: string;
+  processingState?: Record<string, ProcessingBranchState>;
 };
 
 export const STAGES = [
@@ -43,6 +55,7 @@ export const SAMPLE_NOTES = [
     points: ["权重由当前查询与上下文内容共同决定", "长距离依赖不再需要逐步传递", "注意力权重具有一定的可解释性"],
     question: "为什么注意力机制更适合处理长序列中的远距离关系？",
     ocr: "Attention Mechanism / Dynamic Focus / Long-range Dependency",
+    demoTranscript: "传统序列模型通常依赖固定长度的上下文窗口。当输入序列不断变长时，早期信息很难完整传递到后面。注意力机制换了一种方式：模型会根据当前任务，动态判断输入中的哪些部分更值得关注。",
   },
   {
     time: 93,
@@ -52,6 +65,7 @@ export const SAMPLE_NOTES = [
     points: ["Query 与 Key 的相似度决定注意力分数", "Softmax 将分数归一化为权重", "Value 按权重加权求和得到输出"],
     question: "如果 Key 不变而 Value 改变，注意力权重与最终输出会如何变化？",
     ocr: "Q = XWq / K = XWk / V = XWv / softmax(QKᵀ)",
+    demoTranscript: "接下来我们看 Query、Key 和 Value。Query 表示当前要找什么，Key 用来判断候选内容是否相关，Value 则携带最终被读取的信息。Query 与 Key 计算相似度后，再用得到的权重对 Value 做加权求和。",
   },
   {
     time: 189,
@@ -61,6 +75,7 @@ export const SAMPLE_NOTES = [
     points: ["点积结果除以 √dk 完成缩放", "Mask 可以屏蔽未来位置或无效填充", "矩阵运算便于 GPU 并行计算"],
     question: "为什么不缩放 QKᵀ 会让 Softmax 更容易进入饱和区？",
     ocr: "Attention(Q,K,V) = softmax(QKᵀ / √dk)V",
+    demoTranscript: "缩放点积注意力先计算 Query 和 Key 的点积，再除以维度的平方根。这样可以避免高维情况下数值过大，使 Softmax 保持比较稳定的梯度。归一化后的权重最后用于聚合 Value。",
   },
   {
     time: 303,
@@ -70,11 +85,18 @@ export const SAMPLE_NOTES = [
     points: ["每个头拥有独立的投影参数", "多个头可学习互补关系", "拼接后再经过线性层融合信息"],
     question: "增加注意力头数量一定会提升效果吗？还要考虑哪些代价？",
     ocr: "MultiHead(Q,K,V) = Concat(head₁ … headₕ)Wo",
+    demoTranscript: "单个注意力头往往只能捕捉一种关系。多头注意力把输入投影到多个子空间，让不同的头分别学习位置、语义、指代或句法关系。各个头的结果拼接后，再通过线性层完成融合。",
   },
 ] as const;
 
 const STORAGE_KEY = "snapnote.tasks.v1";
 const VIDEO_KEY = "__snapnoteVideoUrls";
+const TASKS_CHANGE_EVENT = "snapnote:tasks-changed";
+const EMPTY_TASKS: SnapTask[] = [];
+
+let cachedTasksRaw: string | null | undefined;
+let cachedTasks: SnapTask[] = EMPTY_TASKS;
+let cachedSeededTasks: SnapTask[] | undefined;
 
 function seededTasks(): SnapTask[] {
   const now = Date.now();
@@ -84,21 +106,55 @@ function seededTasks(): SnapTask[] {
   ];
 }
 
-export function getTasks(): SnapTask[] {
-  if (typeof window === "undefined") return [];
+function normalizeTasks(tasks: SnapTask[]): SnapTask[] {
+  return tasks.map((task) => (
+    task.status === "completed"
+      ? { ...task, progress: 100, stageIndex: STAGES.length - 1 }
+      : task
+  ));
+}
+
+export function getLocalTasksServerSnapshot(): SnapTask[] {
+  return EMPTY_TASKS;
+}
+
+export function getLocalTasksSnapshot(): SnapTask[] {
+  if (typeof window === "undefined") return EMPTY_TASKS;
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw === cachedTasksRaw) return cachedTasks;
     if (raw) {
-      return (JSON.parse(raw) as SnapTask[]).map((task) => (
-        task.status === "completed"
-          ? { ...task, progress: 100, stageIndex: STAGES.length - 1 }
-          : task
-      ));
+      cachedTasksRaw = raw;
+      cachedTasks = normalizeTasks(JSON.parse(raw) as SnapTask[]);
+      return cachedTasks;
     }
   } catch { /* use seeded tasks */ }
-  const seeded = seededTasks();
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(seeded));
-  return seeded;
+  cachedTasksRaw = null;
+  cachedSeededTasks ??= normalizeTasks(seededTasks());
+  cachedTasks = cachedSeededTasks;
+  return cachedTasks;
+}
+
+export function subscribeLocalTasks(onStoreChange: () => void): () => void {
+  if (typeof window === "undefined") return () => undefined;
+  const handleStorage = (event: StorageEvent) => {
+    if (event.key !== STORAGE_KEY) return;
+    cachedTasksRaw = undefined;
+    onStoreChange();
+  };
+  const handleLocalChange = () => {
+    onStoreChange();
+  };
+  window.addEventListener("storage", handleStorage);
+  window.addEventListener(TASKS_CHANGE_EVENT, handleLocalChange);
+  return () => {
+    window.removeEventListener("storage", handleStorage);
+    window.removeEventListener(TASKS_CHANGE_EVENT, handleLocalChange);
+  };
+}
+
+export function getTasks(): SnapTask[] {
+  return getLocalTasksSnapshot();
 }
 
 export function getTask(id: string): SnapTask | undefined {
@@ -106,10 +162,15 @@ export function getTask(id: string): SnapTask | undefined {
 }
 
 export function saveTask(task: SnapTask) {
-  const tasks = getTasks();
+  const tasks = [...getTasks()];
   const index = tasks.findIndex((item) => item.id === task.id);
   if (index >= 0) tasks[index] = task; else tasks.unshift(task);
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
+  const normalized = normalizeTasks(tasks);
+  const raw = JSON.stringify(normalized);
+  localStorage.setItem(STORAGE_KEY, raw);
+  cachedTasksRaw = raw;
+  cachedTasks = normalized;
+  window.dispatchEvent(new Event(TASKS_CHANGE_EVENT));
 }
 
 export function createLocalTask(file: File, asrProvider: SnapTask["asrProvider"], noteStyle: SnapTask["noteStyle"]): SnapTask {

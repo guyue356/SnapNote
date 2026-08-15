@@ -7,7 +7,7 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from .asr import transcribe_audio
 from .config import (
@@ -15,6 +15,7 @@ from .config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
     DEEPSEEK_MODEL,
+    ENABLE_PIPELINE_PARALLELISM,
     FFMPEG_BIN,
     FFPROBE_BIN,
     MAX_VIDEO_DURATION_SECONDS,
@@ -53,6 +54,50 @@ STAGES = [
     ("generating_note", 98, "生成完整结果", "正在组织 Markdown 与分析产物"),
 ]
 
+BRANCHES = {
+    "common": {"label": "准备视频", "weight": 5},
+    "audio": {"label": "音频处理", "weight": 30},
+    "vision": {"label": "画面处理", "weight": 25},
+    "multimodal": {"label": "多模态理解", "weight": 30},
+    "output": {"label": "结果生成", "weight": 10},
+}
+_progress_locks: dict[str, asyncio.Lock] = {}
+
+
+def new_processing_state() -> dict:
+    return {
+        name: {
+            "label": metadata["label"],
+            "stage": "waiting",
+            "title": "等待开始",
+            "message": "等待上游步骤完成",
+            "progress": 0,
+            "status": "queued",
+            "updated_at": None,
+        }
+        for name, metadata in BRANCHES.items()
+    }
+
+
+def _decode_processing_state(raw: str | None) -> dict:
+    try:
+        state = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        state = {}
+    initial = new_processing_state()
+    for name in initial:
+        if isinstance(state.get(name), dict):
+            initial[name].update(state[name])
+    return initial
+
+
+def _overall_progress(state: dict) -> int:
+    weighted = sum(
+        BRANCHES[name]["weight"] * max(0, min(100, int(state[name]["progress"]))) / 100
+        for name in BRANCHES
+    )
+    return max(3, min(100, int(round(weighted))))
+
 
 async def _run(command: list[str], timeout: int = 300):
     def execute():
@@ -62,37 +107,130 @@ async def _run(command: list[str], timeout: int = 300):
     return await asyncio.to_thread(execute)
 
 
-async def _set_stage(
+async def _update_pipeline_state(
     task_id: str,
+    branch: str,
     stage: str,
-    progress: int,
+    branch_progress: int,
     title: str,
     message: str,
+    *,
+    result: dict | None = None,
+    record_stage: bool = True,
+):
+    if branch not in BRANCHES:
+        raise ValueError(f"Unknown pipeline branch: {branch}")
+    lock = _progress_locks.setdefault(task_id, asyncio.Lock())
+    async with lock:
+        async with async_session() as db:
+            task = await db.get(SnapTask, task_id)
+            if not task:
+                raise RuntimeError("任务已不存在")
+            state = _decode_processing_state(task.processing_state_json)
+            progress = max(
+                int(state[branch].get("progress", 0)),
+                max(0, min(100, int(branch_progress))),
+            )
+            completed = result is not None
+            state[branch].update({
+                "stage": stage,
+                "title": title,
+                "message": message,
+                "progress": progress,
+                "status": "completed" if completed and progress >= 100 else "running",
+                "updated_at": utcnow().isoformat(),
+            })
+            overall = max(int(task.progress or 0), _overall_progress(state))
+            task.status = "processing"
+            task.current_stage = stage
+            task.progress = overall
+            task.processing_state_json = json.dumps(state, ensure_ascii=False)
+            task.updated_at = utcnow()
+
+            if record_stage:
+                if completed:
+                    running = (
+                        await db.execute(
+                            select(StageResult)
+                            .where(
+                                StageResult.task_id == task_id,
+                                StageResult.stage == stage,
+                                StageResult.status == "running",
+                            )
+                            .order_by(StageResult.id.desc())
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
+                    if running:
+                        running.status = "completed"
+                        running.result_json = json.dumps(result or {}, ensure_ascii=False)
+                        running.completed_at = utcnow()
+                    else:
+                        db.add(StageResult(
+                            task_id=task_id,
+                            stage=stage,
+                            status="completed",
+                            result_json=json.dumps(result or {}, ensure_ascii=False),
+                            completed_at=utcnow(),
+                        ))
+                else:
+                    db.add(StageResult(
+                        task_id=task_id,
+                        stage=stage,
+                        status="running",
+                        result_json="{}",
+                    ))
+            await db.commit()
+            payload = {
+                "branch": branch,
+                "stage": stage,
+                "progress": overall,
+                "branch_progress": progress,
+                "title": title,
+                "message": message,
+                "processing_state": state,
+                **(result or {}),
+            }
+    await sse_manager.emit(task_id, stage, payload)
+
+
+async def _set_stage(
+    task_id: str,
+    stage_info: tuple,
+    branch: str,
+    branch_progress: int,
+    message: str | None = None,
     result: dict | None = None,
 ):
-    async with async_session() as db:
-        task = await db.get(SnapTask, task_id)
-        if not task:
-            raise RuntimeError("任务已不存在")
-        task.status = "processing"
-        task.current_stage = stage
-        task.progress = progress
-        task.updated_at = utcnow()
-        db.add(StageResult(
-            task_id=task_id,
-            stage=stage,
-            status="completed" if result is not None else "running",
-            result_json=json.dumps(result or {}, ensure_ascii=False),
-            completed_at=utcnow() if result is not None else None,
-        ))
-        await db.commit()
-    await sse_manager.emit(task_id, stage, {
-        "stage": stage,
-        "progress": progress,
-        "title": title,
-        "message": message,
-        **(result or {}),
-    })
+    stage, _, title, default_message = stage_info
+    await _update_pipeline_state(
+        task_id,
+        branch,
+        stage,
+        branch_progress,
+        title,
+        message or default_message,
+        result=result,
+    )
+
+
+async def _report_branch_progress(
+    task_id: str,
+    stage_info: tuple,
+    branch: str,
+    branch_progress: int,
+    message: str,
+):
+    stage, _, title, _ = stage_info
+    await _update_pipeline_state(
+        task_id,
+        branch,
+        stage,
+        branch_progress,
+        title,
+        message,
+        record_stage=False,
+    )
 
 
 async def _probe(video_path: str) -> dict:
@@ -197,9 +335,10 @@ def _aligned_blocks(frames: list[dict], segments: list[dict], duration: float):
         transcript = "".join(related).strip()
         visual = frame.get("visual_analysis", {})
         motion = frame.get("clip_analysis", {})
+        ocr_lines = (frame.get("ocr_text") or "").splitlines()
         title = (
             visual.get("title")
-            or (frame.get("ocr_text") or "").splitlines()[0][:80]
+            or (ocr_lines[0][:80] if ocr_lines else "")
             or f"关键镜头 {index + 1}"
         )
         visual_summary = visual.get("summary") or visual.get("description") or ""
@@ -330,6 +469,303 @@ async def _save_frames(task_id: str, frames: list[dict]):
             await db.commit()
 
 
+async def _run_audio_branch(
+    task_id: str,
+    video_path: str,
+    audio_path: Path,
+    duration: float,
+    asr_provider: str,
+):
+    await _set_stage(task_id, STAGES[1], "audio", 0)
+    await _extract_audio(video_path, audio_path, duration)
+    async with async_session() as db:
+        task = await db.get(SnapTask, task_id)
+        if task:
+            task.audio_path = str(audio_path)
+            await db.commit()
+    await _set_stage(
+        task_id,
+        STAGES[1],
+        "audio",
+        20,
+        "音频提取完成",
+        {"sample_rate": AUDIO_SAMPLE_RATE},
+    )
+
+    await _set_stage(task_id, STAGES[2], "audio", 20)
+
+    async def report_asr_progress(payload: dict):
+        stage_progress = max(0, min(100, int(payload.get("progress_pct", 0))))
+        await _report_branch_progress(
+            task_id,
+            STAGES[2],
+            "audio",
+            20 + round(stage_progress * 0.8),
+            payload.get("detail", "正在执行语音转写"),
+        )
+
+    segments, engine = await transcribe_audio(
+        audio_path, duration, asr_provider, report_asr_progress
+    )
+    async with async_session() as db:
+        task = await db.get(SnapTask, task_id)
+        if task:
+            task.transcripts_json = json.dumps(segments, ensure_ascii=False)
+            await db.commit()
+    await _set_stage(
+        task_id,
+        STAGES[2],
+        "audio",
+        100,
+        f"转写完成，共 {len(segments)} 个片段",
+        {"segment_count": len(segments), "engine": engine},
+    )
+    return segments, engine
+
+
+async def _run_local_vision_branch(
+    task_id: str,
+    video_path: str,
+    duration: float,
+    frames_dir: Path,
+):
+    await _set_stage(task_id, STAGES[3], "vision", 0)
+    shots, shot_stats = await analyze_shots(video_path, duration)
+    await _set_stage(
+        task_id,
+        STAGES[3],
+        "vision",
+        45,
+        f"检测到 {shot_stats['detected_shots']} 个镜头",
+        shot_stats,
+    )
+
+    await _set_stage(task_id, STAGES[4], "vision", 45)
+    frames = await extract_keyframes(video_path, shots, frames_dir)
+    if not frames:
+        raise RuntimeError("未能提取任何关键帧")
+    await _set_stage(
+        task_id,
+        STAGES[4],
+        "vision",
+        75,
+        f"提取 {len(frames)} 张高质量关键帧",
+        {"frame_count": len(frames)},
+    )
+
+    await _set_stage(task_id, STAGES[5], "vision", 75)
+    frames = await asyncio.to_thread(deduplicate_frames, frames, frames_dir)
+    await _save_frames(task_id, frames)
+    await _set_stage(
+        task_id,
+        STAGES[5],
+        "vision",
+        100,
+        f"去重后保留 {len(frames)} 张关键帧",
+        {"frame_count": len(frames)},
+    )
+    return frames, shot_stats
+
+
+async def _gather_required(*coroutines):
+    tasks = [asyncio.create_task(coroutine) for coroutine in coroutines]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+def _merge_frame_results(
+    frames: list[dict], image_frames: list[dict], ocr_frames: list[dict]
+) -> list[dict]:
+    image_by_id = {str(frame["id"]): frame for frame in image_frames}
+    ocr_by_id = {str(frame["id"]): frame for frame in ocr_frames}
+    merged = []
+    for frame in frames:
+        frame_id = str(frame["id"])
+        row = {**frame, **image_by_id.get(frame_id, {})}
+        local_ocr = ocr_by_id.get(frame_id, {}).get("ocr_text")
+        if local_ocr:
+            row["ocr_text"] = local_ocr
+        merged.append(row)
+    return merged
+
+
+async def _run_multimodal_branch(
+    task_id: str,
+    video_path: str,
+    frames: list[dict],
+    frames_dir: Path,
+    clips_dir: Path,
+    segments: list[dict],
+    duration: float,
+):
+    await _set_stage(
+        task_id,
+        STAGES[6],
+        "multimodal",
+        0,
+        "本地 OCR 与 MiMo 关键帧理解将并行执行",
+    )
+    await _set_stage(
+        task_id,
+        STAGES[7],
+        "multimodal",
+        0,
+        "正在并行提取画面文字并理解关键帧",
+    )
+
+    async def run_ocr():
+        rows = await asyncio.to_thread(
+            _ocr_frames, [dict(frame) for frame in frames], frames_dir
+        )
+        ocr_count = sum(bool(frame.get("ocr_text")) for frame in rows)
+        await _set_stage(
+            task_id,
+            STAGES[6],
+            "multimodal",
+            40,
+            "本地 OCR 阶段完成",
+            {"ocr_count": ocr_count},
+        )
+        return rows
+
+    async def report_vision_progress(payload: dict):
+        completed = int(payload.get("completed", 0))
+        total = max(1, int(payload.get("total", 1)))
+        await _report_branch_progress(
+            task_id,
+            STAGES[7],
+            "multimodal",
+            round(completed / total * 40),
+            payload.get("detail", STAGES[7][3]),
+        )
+
+    async def run_image_understanding():
+        try:
+            image_frames, image_stats = await understand_keyframes(
+                [dict(frame) for frame in frames],
+                frames_dir,
+                segments,
+                report_vision_progress,
+            )
+            if MIMO_VISION_REQUIRED and not image_stats.get("enabled"):
+                raise RuntimeError(
+                    f"MiMo 视觉理解不可用：{image_stats.get('reason', 'unknown')}"
+                )
+            return image_frames, image_stats
+        except Exception as error:
+            if MIMO_VISION_REQUIRED:
+                raise
+            return [dict(frame) for frame in frames], {
+                "enabled": False,
+                "error": str(error)[:500],
+                "usage": {},
+            }
+
+    ocr_frames, image_result = await _gather_required(
+        run_ocr(), run_image_understanding()
+    )
+    image_frames, image_stats = image_result
+    frames = _merge_frame_results(frames, image_frames, ocr_frames)
+    await _save_frames(task_id, frames)
+    await _set_stage(
+        task_id,
+        STAGES[7],
+        "multimodal",
+        45,
+        f"已理解 {image_stats.get('analyzed_frames', 0)} 张关键帧",
+        image_stats,
+    )
+
+    await _set_stage(task_id, STAGES[8], "multimodal", 45)
+    clip_stats = {"enabled": False, "clip_count": 0, "usage": {}}
+    try:
+        clips = await create_silent_proxy_clips(
+            video_path, frames, clips_dir, MIMO_VISION_MAX_CLIPS
+        )
+        frames, clip_stats = await understand_clips(clips, frames, segments)
+    except Exception as error:
+        if MIMO_VISION_REQUIRED:
+            raise
+        clip_stats = {"enabled": False, "error": str(error)[:500], "usage": {}}
+    finally:
+        if clips_dir.parent == frames_dir.parent:
+            shutil.rmtree(clips_dir, ignore_errors=True)
+    await _save_frames(task_id, frames)
+    await _set_stage(
+        task_id,
+        STAGES[8],
+        "multimodal",
+        70,
+        f"动态片段分析完成，共 {clip_stats.get('analyzed_clips', 0)} 段",
+        clip_stats,
+    )
+
+    await _set_stage(task_id, STAGES[9], "multimodal", 70)
+    try:
+        visual_analysis, style_stats = await summarize_video_style(
+            frames, segments, duration
+        )
+    except Exception as error:
+        if MIMO_VISION_REQUIRED:
+            raise
+        visual_analysis, style_stats = await summarize_video_style([], [], duration)
+        style_stats["error"] = str(error)[:500]
+    visual_analysis["pipeline_stats"] = {
+        "images": image_stats,
+        "clips": clip_stats,
+        "synthesis": style_stats,
+    }
+    async with async_session() as db:
+        task = await db.get(SnapTask, task_id)
+        if task:
+            task.visual_analysis_json = json.dumps(visual_analysis, ensure_ascii=False)
+            await db.commit()
+    await _set_stage(
+        task_id,
+        STAGES[9],
+        "multimodal",
+        100,
+        "整片风格、叙事和分镜画像已生成",
+        {"provider": visual_analysis.get("provider"), **style_stats},
+    )
+    return frames, visual_analysis, image_stats, clip_stats, style_stats
+
+
+async def _mark_pipeline_failed(task_id: str, error: Exception):
+    lock = _progress_locks.setdefault(task_id, asyncio.Lock())
+    async with lock:
+        async with async_session() as db:
+            task = await db.get(SnapTask, task_id)
+            if not task:
+                return
+            state = _decode_processing_state(task.processing_state_json)
+            timestamp = utcnow().isoformat()
+            for branch in state.values():
+                if branch.get("status") == "running":
+                    branch["status"] = "failed"
+                    branch["message"] = str(error)[:500]
+                    branch["updated_at"] = timestamp
+            task.status = "failed"
+            task.current_stage = "step_error"
+            task.error_message = str(error)[:1000]
+            task.processing_state_json = json.dumps(state, ensure_ascii=False)
+            task.updated_at = utcnow()
+            await db.commit()
+            payload = {
+                "stage": "step_error",
+                "message": str(error)[:500],
+                "progress": task.progress,
+                "processing_state": state,
+            }
+    await sse_manager.emit(task_id, "step_error", payload)
+
+
 async def run_pipeline(task_id: str):
     clips_dir = None
     try:
@@ -344,7 +780,7 @@ async def run_pipeline(task_id: str):
             audio_path = task_dir / "audio.wav"
             asr_provider = task.asr_provider
 
-        await _set_stage(task_id, *STAGES[0])
+        await _set_stage(task_id, STAGES[0], "common", 20)
         metadata = await _probe(video_path)
         source_duration = metadata.get("duration") or 0
         duration = min(source_duration, MAX_VIDEO_DURATION_SECONDS)
@@ -356,109 +792,37 @@ async def run_pipeline(task_id: str):
             task = await db.get(SnapTask, task_id)
             task.duration = duration
             await db.commit()
-        await _set_stage(task_id, STAGES[0][0], STAGES[0][1], STAGES[0][2], "视频解析完成", metadata)
-
-        await _set_stage(task_id, *STAGES[1])
-        await _extract_audio(video_path, audio_path, duration)
-        async with async_session() as db:
-            task = await db.get(SnapTask, task_id)
-            task.audio_path = str(audio_path)
-            await db.commit()
-        await _set_stage(task_id, STAGES[1][0], STAGES[1][1], STAGES[1][2], "音频提取完成", {"sample_rate": AUDIO_SAMPLE_RATE})
-
-        await _set_stage(task_id, *STAGES[2])
-
-        async def report_asr_progress(payload: dict):
-            await sse_manager.emit(task_id, "transcribing", {
-                "stage": "transcribing",
-                "progress": STAGES[2][1],
-                "stage_progress": int(payload.get("progress_pct", 0)),
-                "title": STAGES[2][2],
-                "message": payload.get("detail", "正在执行语音转写"),
-                **payload,
-            })
-
-        segments, engine = await transcribe_audio(
-            audio_path, duration, asr_provider, report_asr_progress
+        await _set_stage(
+            task_id, STAGES[0], "common", 100, "视频解析完成", metadata
         )
-        async with async_session() as db:
-            task = await db.get(SnapTask, task_id)
-            task.transcripts_json = json.dumps(segments, ensure_ascii=False)
-            await db.commit()
-        await _set_stage(task_id, STAGES[2][0], STAGES[2][1], STAGES[2][2], f"转写完成，共 {len(segments)} 个片段", {"segment_count": len(segments), "engine": engine})
 
-        await _set_stage(task_id, *STAGES[3])
-        shots, shot_stats = await analyze_shots(video_path, duration)
-        await _set_stage(task_id, STAGES[3][0], STAGES[3][1], STAGES[3][2], f"检测到 {shot_stats['detected_shots']} 个镜头", shot_stats)
-
-        await _set_stage(task_id, *STAGES[4])
-        frames = await extract_keyframes(video_path, shots, frames_dir)
-        if not frames:
-            raise RuntimeError("未能提取任何关键帧")
-        await _set_stage(task_id, STAGES[4][0], STAGES[4][1], STAGES[4][2], f"提取 {len(frames)} 张高质量关键帧", {"frame_count": len(frames)})
-
-        await _set_stage(task_id, *STAGES[5])
-        frames = await asyncio.to_thread(deduplicate_frames, frames, frames_dir)
-        await _save_frames(task_id, frames)
-        await _set_stage(task_id, STAGES[5][0], STAGES[5][1], STAGES[5][2], f"去重后保留 {len(frames)} 张关键帧", {"frame_count": len(frames)})
-
-        await _set_stage(task_id, *STAGES[6])
-        frames = await asyncio.to_thread(_ocr_frames, frames, frames_dir)
-        await _save_frames(task_id, frames)
-        await _set_stage(task_id, STAGES[6][0], STAGES[6][1], STAGES[6][2], "本地 OCR 阶段完成", {"ocr_count": sum(bool(frame.get('ocr_text')) for frame in frames)})
-
-        await _set_stage(task_id, *STAGES[7])
-
-        async def report_vision_progress(payload: dict):
-            await sse_manager.emit(task_id, "understanding_frames", {
-                "stage": "understanding_frames",
-                "progress": STAGES[7][1],
-                "stage_progress": int(payload.get("completed", 0) / max(1, payload.get("total", 1)) * 100),
-                "title": STAGES[7][2],
-                "message": payload.get("detail", STAGES[7][3]),
-                **payload,
-            })
-
-        try:
-            frames, image_stats = await understand_keyframes(
-                frames, frames_dir, segments, report_vision_progress
+        audio_branch = _run_audio_branch(
+            task_id, video_path, audio_path, duration, asr_provider
+        )
+        vision_branch = _run_local_vision_branch(
+            task_id, video_path, duration, frames_dir
+        )
+        if ENABLE_PIPELINE_PARALLELISM:
+            audio_result, vision_result = await _gather_required(
+                audio_branch, vision_branch
             )
-            if MIMO_VISION_REQUIRED and not image_stats.get("enabled"):
-                raise RuntimeError(f"MiMo 视觉理解不可用：{image_stats.get('reason', 'unknown')}")
-        except Exception as error:
-            if MIMO_VISION_REQUIRED:
-                raise
-            image_stats = {"enabled": False, "error": str(error)[:500], "usage": {}}
-        await _save_frames(task_id, frames)
-        await _set_stage(task_id, STAGES[7][0], STAGES[7][1], STAGES[7][2], f"已理解 {image_stats.get('analyzed_frames', 0)} 张关键帧", image_stats)
+        else:
+            audio_result = await audio_branch
+            vision_result = await vision_branch
+        segments, engine = audio_result
+        frames, shot_stats = vision_result
 
-        await _set_stage(task_id, *STAGES[8])
-        clip_stats = {"enabled": False, "clip_count": 0, "usage": {}}
-        try:
-            clips = await create_silent_proxy_clips(
-                video_path, frames, clips_dir, MIMO_VISION_MAX_CLIPS
+        frames, visual_analysis, image_stats, clip_stats, style_stats = (
+            await _run_multimodal_branch(
+                task_id,
+                video_path,
+                frames,
+                frames_dir,
+                clips_dir,
+                segments,
+                duration,
             )
-            frames, clip_stats = await understand_clips(clips, frames, segments)
-        except Exception as error:
-            if MIMO_VISION_REQUIRED:
-                raise
-            clip_stats = {"enabled": False, "error": str(error)[:500], "usage": {}}
-        finally:
-            if clips_dir and clips_dir.parent == task_dir:
-                shutil.rmtree(clips_dir, ignore_errors=True)
-        await _save_frames(task_id, frames)
-        await _set_stage(task_id, STAGES[8][0], STAGES[8][1], STAGES[8][2], f"动态片段分析完成，共 {clip_stats.get('analyzed_clips', 0)} 段", clip_stats)
-
-        await _set_stage(task_id, *STAGES[9])
-        try:
-            visual_analysis, style_stats = await summarize_video_style(
-                frames, segments, duration
-            )
-        except Exception as error:
-            if MIMO_VISION_REQUIRED:
-                raise
-            visual_analysis, style_stats = await summarize_video_style([], [], duration)
-            style_stats["error"] = str(error)[:500]
+        )
         visual_analysis["pipeline_stats"] = {
             "shots": shot_stats,
             "images": image_stats,
@@ -469,13 +833,19 @@ async def run_pipeline(task_id: str):
             task = await db.get(SnapTask, task_id)
             task.visual_analysis_json = json.dumps(visual_analysis, ensure_ascii=False)
             await db.commit()
-        await _set_stage(task_id, STAGES[9][0], STAGES[9][1], STAGES[9][2], "整片风格、叙事和分镜画像已生成", {"provider": visual_analysis.get("provider"), **style_stats})
 
-        await _set_stage(task_id, *STAGES[10])
+        await _set_stage(task_id, STAGES[10], "output", 0)
         blocks = _aligned_blocks(frames, segments, duration)
-        await _set_stage(task_id, STAGES[10][0], STAGES[10][1], STAGES[10][2], f"完成 {len(blocks)} 个镜头与转写片段对齐", {"alignment_count": len(blocks)})
+        await _set_stage(
+            task_id,
+            STAGES[10],
+            "output",
+            25,
+            f"完成 {len(blocks)} 个镜头与转写片段对齐",
+            {"alignment_count": len(blocks)},
+        )
 
-        await _set_stage(task_id, *STAGES[11])
+        await _set_stage(task_id, STAGES[11], "output", 25)
         try:
             async with async_session() as db:
                 task = await db.get(SnapTask, task_id)
@@ -484,18 +854,38 @@ async def run_pipeline(task_id: str):
                 )
         except Exception:
             pass
-        await _set_stage(task_id, STAGES[11][0], STAGES[11][1], STAGES[11][2], "结构化内容生成完成", {"block_count": len(blocks)})
+        await _set_stage(
+            task_id,
+            STAGES[11],
+            "output",
+            75,
+            "结构化内容生成完成",
+            {"block_count": len(blocks)},
+        )
 
-        await _set_stage(task_id, *STAGES[12])
+        await _set_stage(task_id, STAGES[12], "output", 75)
         async with async_session() as db:
             task = await db.get(SnapTask, task_id)
             task.notes_json = json.dumps(blocks, ensure_ascii=False)
             task.final_markdown = _markdown(task, blocks, visual_analysis)
-            task.status = "completed"
-            task.current_stage = "complete"
-            task.progress = 100
             task.updated_at = utcnow()
             await db.commit()
+        await _set_stage(
+            task_id,
+            STAGES[12],
+            "output",
+            100,
+            "完整结果已生成",
+            {"block_count": len(blocks)},
+        )
+        async with async_session() as db:
+            task = await db.get(SnapTask, task_id)
+            if task:
+                task.status = "completed"
+                task.current_stage = "complete"
+                task.progress = 100
+                task.updated_at = utcnow()
+                await db.commit()
         await sse_manager.emit(task_id, "complete", {
             "stage": "complete",
             "progress": 100,
@@ -503,18 +893,9 @@ async def run_pipeline(task_id: str):
             "message": "转写、关键帧、动态镜头与整片风格分析均已完成",
         })
     except Exception as error:
-        async with async_session() as db:
-            task = await db.get(SnapTask, task_id)
-            if task:
-                task.status = "failed"
-                task.current_stage = "step_error"
-                task.error_message = str(error)[:1000]
-                task.updated_at = utcnow()
-                await db.commit()
-        await sse_manager.emit(task_id, "step_error", {
-            "stage": "step_error",
-            "message": str(error)[:500],
-        })
+        await _mark_pipeline_failed(task_id, error)
+    finally:
+        _progress_locks.pop(task_id, None)
 
 
 async def reset_task(task_id: str, provider: str | None = None):
@@ -530,6 +911,7 @@ async def reset_task(task_id: str, provider: str | None = None):
         task.transcripts_json = "[]"
         task.notes_json = "[]"
         task.visual_analysis_json = "{}"
+        task.processing_state_json = json.dumps(new_processing_state(), ensure_ascii=False)
         task.final_markdown = ""
         if provider:
             task.asr_provider = provider

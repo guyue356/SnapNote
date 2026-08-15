@@ -276,8 +276,13 @@ flowchart LR
     Probe --> Scan["2 fps 流式场景扫描"]
     Scan --> Frames["镜头内画质择优"]
     Frames --> Dedup["pHash 去重"]
-    Dedup --> Images["MiMo 多图批量理解"]
-    Images --> Decision{"动态或不确定？"}
+    ASR --> Join["音频 / 画面分支汇合"]
+    Dedup --> Join
+    Join --> Images["MiMo 多图批量理解"]
+    Join --> OCR["本地 OCR（与图片理解并行）"]
+    Images --> Merge["按 frame_id 合并"]
+    OCR --> Merge
+    Merge --> Decision{"动态或不确定？"}
     Decision -->|"是"| Proxy["无声短视频代理"]
     Proxy --> VideoAI["MiMo 视频理解"]
     Decision -->|"否"| Align["多模态时间对齐"]
@@ -287,25 +292,15 @@ flowchart LR
     Profile --> Markdown["结构化 JSON 与 Markdown"]
 ```
 
-后端按以下阶段写入进度并发送 SSE：
+后端将进度持久化为准备视频、音频处理、画面处理、多模态理解和结果生成五条分支，并通过 SSE 同时推送分支进度与单调递增的总体进度。音频和画面分支在元信息解析后并行，在关键帧理解前汇合：
 
-| 阶段 | 默认进度 | 主要产物 |
-| --- | ---: | --- |
-| `upload_complete` | 3% | 原始视频与任务记录 |
-| `probing_video` | 6% | 时长、分辨率、编码信息 |
-| `extracting_audio` | 12% | 16kHz 单声道 WAV |
-| `transcribing` | 28% | 带开始/结束时间的转写片段 |
-| `detecting_frames` | 38% | 场景边界、运动与画质采样 |
-| `selecting_frames` | 46% | 每个镜头的代表帧 |
-| `deduplicating_frames` | 51% | pHash 去重后的关键帧 |
-| `running_ocr` | 56% | 可选本地 OCR 文字 |
-| `understanding_frames` | 68% | MiMo 多图视觉语义 |
-| `understanding_clips` | 76% | 动态片段的动作、运镜和转场 |
-| `analyzing_style` | 84% | 整片叙事、风格、爆款与分镜画像 |
-| `aligning` | 89% | 镜头、视觉语义和转写对齐结果 |
-| `generating_blocks` | 94% | 逐镜头结构化内容 |
-| `generating_note` | 98% | 完整 Markdown 与分析 JSON |
-| `complete` | 100% | 可浏览与导出的任务结果 |
+| 分支 | 阶段 | 主要产物 |
+| --- | --- | --- |
+| 准备视频 | `upload_complete`、`probing_video` | 原始视频、时长、分辨率与编码信息 |
+| 音频处理 | `extracting_audio`、`transcribing` | 16kHz 单声道 WAV、时间戳转写 |
+| 画面处理 | `detecting_frames`、`selecting_frames`、`deduplicating_frames` | 镜头边界、质量指标和去重关键帧 |
+| 多模态理解 | `running_ocr`、`understanding_frames`、`understanding_clips`、`analyzing_style` | OCR、静态/动态视觉语义和整片画像 |
+| 结果生成 | `aligning`、`generating_blocks`、`generating_note` | 时间对齐、结构化内容和 Markdown |
 
 ---
 
@@ -487,6 +482,7 @@ SnapNote/
 | `DATABASE_URL` | 否 | SQLite async URL | 可覆盖数据库连接 |
 | `MAX_UPLOAD_SIZE_MB` | 否 | `2048` | 上传大小上限 |
 | `MAX_VIDEO_DURATION_SECONDS` | 否 | `3600` | 最大处理时长 |
+| `ENABLE_PIPELINE_PARALLELISM` | 否 | `1` | 是否并行执行音频转写与本地画面处理分支 |
 | `DEFAULT_ASR_PROVIDER` | 否 | `whisper` | 未指定时使用的 ASR Provider |
 | `ENABLE_LOCAL_WHISPER` | 否 | `1` | 是否启用本地 Whisper |
 | `WHISPER_MODEL_SIZE` | 否 | `large-v3` | faster-whisper 模型规格 |

@@ -14,6 +14,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite+aiosqlite:///{STORAGE_ROOT / '
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://127.0.0.1:43871")
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "2048"))
 MAX_VIDEO_DURATION_SECONDS = int(os.getenv("MAX_VIDEO_DURATION_SECONDS", "3600"))
+ENABLE_PIPELINE_PARALLELISM = os.getenv("ENABLE_PIPELINE_PARALLELISM", "1").lower() in {
+    "1", "true", "yes", "on"
+}
 
 DEFAULT_ASR_PROVIDER = os.getenv("DEFAULT_ASR_PROVIDER", "whisper").strip().lower()
 if DEFAULT_ASR_PROVIDER not in {"whisper", "mimo"}:

@@ -1,4 +1,4 @@
-import type { SnapTask } from "./demo";
+import type { ProcessingBranchState, SnapTask } from "./demo";
 
 export const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "").replace(/\/$/, "");
 export const hasBackend = Boolean(API_BASE);
@@ -28,6 +28,8 @@ export type BackendVisualAnalysis = {
   viral_elements?: string[];
   recurring_patterns?: string[];
   recommendations?: string[];
+  structure?: Array<{ stage: string; start_time: number; end_time: number; description: string }>;
+  narrative_structure?: Array<{ stage: string; start_time: number; end_time: number; description: string }>;
   storyboard?: Array<{ start_time: number; end_time: number; shot: string; purpose: string }>;
   provider?: string;
 };
@@ -51,6 +53,7 @@ export type BackendTask = {
   final_markdown: string;
   video_url: string;
   created_at: string;
+  processing_state?: Record<string, ProcessingBranchState>;
 };
 
 export function toLocalTask(task: BackendTask): SnapTask {
@@ -74,6 +77,8 @@ export function toLocalTask(task: BackendTask): SnapTask {
     noteStyle: task.note_style,
     frameCount: task.frame_count,
     createdAt: task.created_at,
+    errorMessage: task.error_message,
+    processingState: task.processing_state,
   };
 }
 

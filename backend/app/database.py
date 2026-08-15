@@ -33,6 +33,7 @@ class SnapTask(Base):
     transcripts_json: Mapped[str] = mapped_column(Text, default="[]")
     notes_json: Mapped[str] = mapped_column(Text, default="[]")
     visual_analysis_json: Mapped[str] = mapped_column(Text, default="{}")
+    processing_state_json: Mapped[str] = mapped_column(Text, default="{}")
     final_markdown: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
@@ -65,5 +66,10 @@ async def init_db():
             if "visual_analysis_json" not in {row["name"] for row in columns}:
                 await connection.execute(text(
                     "ALTER TABLE snap_tasks ADD COLUMN visual_analysis_json "
+                    "TEXT NOT NULL DEFAULT '{}'"
+                ))
+            if "processing_state_json" not in {row["name"] for row in columns}:
+                await connection.execute(text(
+                    "ALTER TABLE snap_tasks ADD COLUMN processing_state_json "
                     "TEXT NOT NULL DEFAULT '{}'"
                 ))

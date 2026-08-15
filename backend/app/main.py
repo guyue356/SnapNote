@@ -15,7 +15,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from .config import DEFAULT_ASR_PROVIDER, FRONTEND_ORIGIN, MAX_UPLOAD_SIZE_MB, STORAGE_ROOT, TASKS_DIR
 from .database import SnapTask, async_session, init_db
-from .pipeline import reset_task, run_pipeline
+from .pipeline import new_processing_state, reset_task, run_pipeline
 from .schemas import RetryRequest, TaskCreated
 from .sse_manager import sse_manager
 
@@ -38,6 +38,10 @@ def _safe_filename(filename: str) -> str:
 
 def _task_payload(task: SnapTask):
     frames = json.loads(task.frames_json or "[]")
+    try:
+        processing_state = json.loads(task.processing_state_json or "{}")
+    except json.JSONDecodeError:
+        processing_state = {}
     return {
         "id": task.id, "filename": task.filename, "title": Path(task.filename).stem,
         "duration": task.duration, "status": task.status, "current_stage": task.current_stage,
@@ -46,6 +50,7 @@ def _task_payload(task: SnapTask):
         "transcript_segments": json.loads(task.transcripts_json or "[]"),
         "note_blocks": json.loads(task.notes_json or "[]"), "final_markdown": task.final_markdown,
         "visual_analysis": json.loads(task.visual_analysis_json or "{}"),
+        "processing_state": processing_state,
         "video_url": f"/api/snapnote/tasks/{task.id}/video", "created_at": task.created_at,
     }
 
@@ -78,7 +83,7 @@ async def create_task(background_tasks: BackgroundTasks, video: UploadFile = Fil
         raise
 
     async with async_session() as db:
-        task = SnapTask(id=task_id, filename=safe_name, video_path=str(video_path), status="queued", current_stage="upload_complete", progress=3, asr_provider=asr_provider if asr_provider in {"mimo", "whisper"} else DEFAULT_ASR_PROVIDER, note_style=note_style if note_style in {"classroom", "meeting"} else "classroom")
+        task = SnapTask(id=task_id, filename=safe_name, video_path=str(video_path), status="queued", current_stage="upload_complete", progress=3, asr_provider=asr_provider if asr_provider in {"mimo", "whisper"} else DEFAULT_ASR_PROVIDER, note_style=note_style if note_style in {"classroom", "meeting"} else "classroom", processing_state_json=json.dumps(new_processing_state(), ensure_ascii=False))
         db.add(task)
         await db.commit()
     await sse_manager.emit(task_id, "upload_complete", {"stage": "upload_complete", "progress": 3, "title": "上传完成", "message": "视频已安全保存"})

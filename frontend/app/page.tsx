@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, DragEvent, useEffect, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import BrandHeader from "./components/BrandHeader";
 import { createBackendTask, fetchBackendTasks, hasBackend, toLocalTask } from "./lib/api";
@@ -8,8 +8,10 @@ import {
   createLocalTask,
   formatBytes,
   formatDuration,
-  getTasks,
+  getLocalTasksServerSnapshot,
+  getLocalTasksSnapshot,
   saveVideoUrl,
+  subscribeLocalTasks,
   type SnapTask,
 } from "./lib/demo";
 
@@ -26,11 +28,19 @@ export default function Home() {
   const [error, setError] = useState("");
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
-  const [tasks, setTasks] = useState<SnapTask[]>([]);
+  const localTasks = useSyncExternalStore(subscribeLocalTasks, getLocalTasksSnapshot, getLocalTasksServerSnapshot);
+  const [remoteTasks, setRemoteTasks] = useState<SnapTask[]>([]);
+  const tasks = hasBackend ? remoteTasks : localTasks;
 
   useEffect(() => {
-    setTasks(getTasks());
-    if (hasBackend) fetchBackendTasks().then((items) => setTasks(items.map(toLocalTask))).catch(() => undefined);
+    if (!hasBackend) return;
+    let cancelled = false;
+    fetchBackendTasks()
+      .then((items) => {
+        if (!cancelled) setRemoteTasks(items.map(toLocalTask));
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
   }, []);
 
   function chooseFile(next: File | undefined) {
