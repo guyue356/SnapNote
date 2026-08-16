@@ -15,6 +15,7 @@ from .config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
     DEEPSEEK_MODEL,
+    ENABLE_KNOWLEDGE_AUTO_BUILD,
     ENABLE_PIPELINE_PARALLELISM,
     FFMPEG_BIN,
     FFPROBE_BIN,
@@ -29,6 +30,7 @@ from .mimo_vision import (
     understand_clips,
     understand_keyframes,
 )
+from .knowledge import build_knowledge_asset
 from .sse_manager import sse_manager
 from .vision import (
     analyze_shots,
@@ -892,6 +894,13 @@ async def run_pipeline(task_id: str):
             "title": "处理完成",
             "message": "转写、关键帧、动态镜头与整片风格分析均已完成",
         })
+        if ENABLE_KNOWLEDGE_AUTO_BUILD:
+            # Knowledge is derived and isolated: a failure here must never turn a
+            # successfully processed source task into a failed pipeline task.
+            try:
+                await build_knowledge_asset(task_id, trigger="automatic")
+            except Exception:
+                pass
     except Exception as error:
         await _mark_pipeline_failed(task_id, error)
     finally:

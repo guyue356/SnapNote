@@ -244,9 +244,23 @@ button { color: inherit; }
 .result-meta { display: flex; align-items: center; gap: 10px; font-size: 9px; color: var(--muted); }
 .result-meta span { color: var(--purple); background: var(--purple-soft); padding: 5px 8px; border-radius: 5px; font-weight: 700; }
 .result-meta em { color: #347a5d; font-style: normal; }
-.secondary-button, .dark-button { height: 38px; border-radius: 9px; padding: 0 14px; font-size: 10px; font-weight: 700; cursor: pointer; }
+.knowledge-status { width: fit-content; max-width: 680px; display: flex; align-items: center; gap: 9px; margin-top: 12px; padding: 7px 9px; border: 1px solid #dcd6e7; border-radius: 8px; color: #544c5d; background: #faf8fd; font-size: 9px; }
+.knowledge-status span { white-space: nowrap; }
+.knowledge-status strong { color: #347a5d; }
+.knowledge-status small { color: var(--muted); font-size: 9px; }
+.knowledge-status button { border: 0; padding: 0; color: var(--purple); background: transparent; font-size: 9px; font-weight: 800; cursor: pointer; white-space: nowrap; }
+.knowledge-status button:disabled { opacity: .55; cursor: wait; }
+.knowledge-status.knowledge-building strong { color: #84651c; }
+.knowledge-status.knowledge-degraded { border-color: #ead59a; background: #fffaf0; }
+.knowledge-status.knowledge-degraded strong { color: #8b6712; }
+.knowledge-status.knowledge-failed { border-color: #efc4bf; background: #fff6f5; }
+.knowledge-status.knowledge-failed strong { color: #a53b32; }
+.knowledge-status-error { margin-top: 7px !important; color: #a53b32 !important; }
+.secondary-button, .dark-button, .danger-button { height: 38px; border-radius: 9px; padding: 0 14px; font-size: 10px; font-weight: 700; cursor: pointer; }
 .secondary-button { border: 1px solid var(--line); background: white; }
 .dark-button { border: 1px solid var(--ink); background: var(--ink); color: white; }
+.danger-button { border: 1px solid #efc4bf; color: #9b3028; background: #fff8f7; }
+.danger-button:disabled { opacity: .55; cursor: wait; }
 .secondary-button:hover { border-color: var(--purple); color: var(--purple); }
 .dark-button:hover { background: var(--purple); border-color: var(--purple); }
 .summary-banner { display: grid; grid-template-columns: 44px 1fr auto; gap: 16px; align-items: start; padding: 18px 20px; border-radius: 13px; background: #efe9ff; border: 1px solid #dacdf9; }
@@ -442,6 +456,8 @@ button { color: inherit; }
   .branch-list li:first-child, .branch-list li:nth-child(4), .branch-list li:nth-child(5) { grid-column: auto; }
   .title-actions { align-items: flex-start; flex-direction: column; }
   .title-actions h1 { font-size: 28px; }
+  .knowledge-status { width: 100%; align-items: flex-start; flex-wrap: wrap; }
+  .knowledge-status small { flex: 1 1 220px; }
   .summary-banner { grid-template-columns: 34px 1fr; }
   .summary-glyph { width: 32px; height: 32px; }
   .summary-banner button { grid-column: 2; justify-self: start; }

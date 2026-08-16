@@ -4,7 +4,7 @@
 
 # SnapNote
 
-> 用低成本精确 ASR、本地智能抽帧和 MiMo v2.5，把长视频变成可检索笔记、视觉风格画像与分镜分析。
+> 把长视频转成可回看、可检索、可引用的本地知识资产。
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-7147e8?style=flat-square)](./LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
@@ -12,7 +12,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=111)](https://react.dev/)
 
-[本地启动](#方式二windows-一键启动) · [产品 PRD](./PRD/SnapNote_PRD_v1.md) · [Web Demo PRD](./PRD/SnapNote_Web_Demo_PRD_v1.md) · [API 文档](#api-接口)
+[本地启动](#方式二windows-一键启动) · [知识资产化 PRD](./PRD/PRD-DEV-001-SnapNote-知识资产化一期.md) · [产品规划](./PRD/PRD-ROADMAP-001-SnapNote-未来产品规划.md) · [API 文档](#api-接口)
 
 </div>
 
@@ -23,6 +23,8 @@
 视频通常包含两条同等重要的信息线：说了什么，以及画面如何表达。纯语音转写只能保留前者；把原始长视频直接交给视觉大模型又会产生不必要的 Token 和等待时间。
 
 SnapNote 采用混合路线：本机 `faster-whisper` 负责低成本精确 ASR，本地算法完成镜头检测与关键帧质量择优，MiMo v2.5 只理解筛选后的多图和少量动态短片。结果把镜头、转写、视觉语义、内容风格和 storyboard 绑定到同一时间线，可用于课程/会议笔记，也可扩展到长视频批量分析、爆款素材风格学习和分镜研究。
+
+任务完成后，系统还会把原有 JSON 快照派生为版本化知识资产：资产、章节、原文片段、检索分块和媒体引用都拥有稳定标识与来源关系。后续功能无需理解数据库表或大段 JSON，就能按明确范围检索证据并跳回原视频核验；历史任务也能在不重新调用 ASR、OCR 或大模型的情况下幂等回填。
 
 > [!IMPORTANT]
 > 项目当前以本地运行作为主要使用方式。原视频、ASR 权重和中间产物保存在本机；只有筛选后的关键帧、动态代理片段及其上下文会按配置发送给 MiMo。
@@ -52,7 +54,13 @@ ASR 可在本机 Whisper 与 MIMO-ASR 间选择；视觉统一使用 `mimo-v2.5`
 - **浏览器演示模式**：不设置后端地址，任务、进度和示例笔记保存在 `localStorage`，便于不启动后端时体验界面。
 - **真实处理模式**：设置 `NEXT_PUBLIC_API_BASE_URL`，前端改用 FastAPI、SQLite、本地文件与 SSE 处理真实视频。
 
-### 6. Markdown 导出与历史任务
+### 6. 版本化知识资产与可引用检索
+
+完成任务会自动派生 `KnowledgeAsset`，并按来源哈希、Schema 版本和 Builder 版本管理不可变版本。系统提供资产、章节、原文和关键帧只读接口，以及中文关键词检索；每条命中都返回稳定分块 ID、来源版本、时间范围和受控媒体引用。
+
+构建失败不会改变原视频任务的完成状态。历史数据支持 `dry-run`、正式执行、失败重试和强制重建；相同来源重复执行会直接跳过，不产生重复实体。
+
+### 7. Markdown 导出与历史任务
 
 任务完成后可导出包含摘要、章节、时间锚点、关键画面、知识点和复习问题的 Markdown。SQLite 保存任务状态、阶段结果、转写、画面和笔记 JSON，首页提供历史任务入口。
 
@@ -78,6 +86,7 @@ ASR 可在本机 Whisper 与 MIMO-ASR 间选择；视觉统一使用 `mimo-v2.5`
 | 中文优先，兼容 Whisper 支持的其他语言 | 按镜头组织的图文笔记与原始转写 |
 | 建议 60 分钟以内 | 时间锚点、视觉语义、风格、爆款元素与 storyboard |
 | 至少包含一路可识别音频 | 原始转写与 Markdown 文件 |
+| 已完成的当前或历史任务 | 版本化资产、章节、检索分块和受控媒体引用 |
 
 ---
 
@@ -167,6 +176,8 @@ Copy-Item .env.example .env
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 43872
 ```
 
+FastAPI 启动时会幂等执行数据库迁移：已有 `snap_tasks` 数据保持不变，并补充知识资产相关表与索引。生产或重要本地数据升级前，仍建议先备份 `storage/app.db`。
+
 前端需要在另一个终端中启动：
 
 ```powershell
@@ -226,6 +237,35 @@ Invoke-RestMethod http://127.0.0.1:43872/api/health
 - 默认最大处理时长：3600 秒
 - 推荐内容：课程、会议、访谈、产品、剧情、短视频或屏幕录制
 
+### 知识资产状态与重建
+
+真实处理模式下，结果页顶部会显示知识资产状态：`未构建`、`构建中`、`可用`、`部分可用`、`构建失败` 或 `删除中`。重建操作只重新解析现有章节、原文、笔记和画面引用，不会重新运行 ASR、OCR、MiMo 或 DeepSeek，也不会覆盖原任务结果。
+
+### 历史任务回填
+
+先执行只读预览，确认候选数和风险后再正式写入：
+
+```powershell
+cd backend
+conda run -n snapnote python -m app.backfill_knowledge --dry-run
+conda run -n snapnote python -m app.backfill_knowledge --execute
+```
+
+常用范围参数：
+
+```powershell
+# 指定一个或多个任务
+conda run -n snapnote python -m app.backfill_knowledge --execute --task-id <task-id>
+
+# 仅重试失败或部分可用资产
+conda run -n snapnote python -m app.backfill_knowledge --execute --retry-failed
+
+# 来源未变化时也显式创建新版本
+conda run -n snapnote python -m app.backfill_knowledge --execute --force-rebuild
+```
+
+回填逐任务提交并输出候选、可用、部分可用、跳过、失败和耗时统计；中断后使用相同命令重跑即可从已提交结果继续。
+
 ---
 
 ## 系统架构
@@ -236,31 +276,35 @@ flowchart TD
     Web -->|"演示模式"| Local["localStorage 与示例任务"]
     Web -->|"HTTP 与 SSE"| API["FastAPI 服务"]
 
-    API --> DB[("SQLite")]
+    API --> TaskDB[("任务快照 SQLite")]
     API --> Files["本地任务文件"]
     API --> Pipeline["多模态处理流水线"]
+    API --> Query["只读知识服务"]
 
-    Pipeline --> Media["ffprobe / ffmpeg / NumPy"]
-    Pipeline --> ASR["faster-whisper 或 MIMO-ASR"]
-    Pipeline --> OCR["PaddleOCR 可选"]
-    Pipeline --> MIMO["MiMo v2.5 多模态"]
-
-    Media --> Frames["镜头检测与质量择优"]
-    Frames --> MIMO
-    MIMO --> Align["多模态时间对齐"]
-    ASR --> Align
-    OCR --> Align
-    Align --> Notes["分镜画像、笔记与 Markdown"]
-    Notes --> DB
+    Pipeline --> Media["本地媒体与视觉算法"]
+    Pipeline --> Providers["ASR / OCR / MiMo Providers"]
+    Media --> Assemble["时间对齐与结构化结果"]
+    Providers --> Assemble
+    Assemble --> Notes["分镜画像、笔记与 Markdown"]
+    Notes --> TaskDB
     Notes --> Web
+    Notes --> Builder["知识资产构建器"]
+
+    TaskDB --> Builder
+    Files --> Builder
+    Builder --> KnowledgeDB[("版本化知识实体")]
+    KnowledgeDB --> Query
+    Query -->|"范围过滤与关键词检索"| API
 ```
 
 | 模块 | 职责 |
 | --- | --- |
 | Vinext Web | 上传、任务列表、实时进度、播放器与笔记联动、导出入口 |
-| FastAPI | 文件校验、任务 API、SSE、视频与 Markdown 文件响应 |
+| FastAPI | 文件校验、任务 API、知识只读 API、SSE、视频与 Markdown 文件响应 |
 | Pipeline | 视频解析、ASR、镜头检测、关键帧择优、动态代理、MiMo 理解、对齐和结果生成 |
-| SQLAlchemy async | 保存任务状态、阶段历史和最终产物索引 |
+| Knowledge Builder | 从现有 JSON 与媒体元数据派生稳定、幂等、可重建的知识版本，不调用外部 AI |
+| Knowledge Query | 统一处理资产范围、状态过滤、中文关键词评分、时间引用和媒体可用性 |
+| SQLAlchemy async | 保存任务快照、阶段历史、Schema Migration 和规范知识实体 |
 | 本地文件系统 | 按 UUID 隔离存储原视频、音频、关键帧和导出文件 |
 | Provider 层 | Whisper / MIMO-ASR 双转写；MiMo v2.5 图片、视频与结构化输出复用同一 API Key |
 
@@ -274,19 +318,14 @@ flowchart LR
     Probe --> Audio["提取音频"]
     Audio --> ASR["带时间戳转写"]
     Probe --> Scan["2 fps 流式场景扫描"]
-    Scan --> Frames["镜头内画质择优"]
-    Frames --> Dedup["pHash 去重"]
+    Scan --> Frames["镜头内画质择优与 pHash 去重"]
     ASR --> Join["音频 / 画面分支汇合"]
-    Dedup --> Join
-    Join --> Images["MiMo 多图批量理解"]
-    Join --> OCR["本地 OCR（与图片理解并行）"]
-    Images --> Merge["按 frame_id 合并"]
-    OCR --> Merge
-    Merge --> Decision{"动态或不确定？"}
-    Decision -->|"是"| Proxy["无声短视频代理"]
-    Proxy --> VideoAI["MiMo 视频理解"]
+    Frames --> Join
+    Join --> Visual["OCR 与 MiMo 多图理解"]
+    Visual --> Decision{"动态或不确定？"}
+    Decision -->|"是"| Proxy["无声代理与 MiMo 视频理解"]
     Decision -->|"否"| Align["多模态时间对齐"]
-    VideoAI --> Align
+    Proxy --> Align
     ASR --> Align
     Align --> Profile["风格 / 叙事 / 爆款 / 分镜画像"]
     Profile --> Markdown["结构化 JSON 与 Markdown"]
@@ -304,9 +343,60 @@ flowchart LR
 
 ---
 
+## 知识资产化与检索
+
+知识层是现有任务快照之上的派生查询层，不替换 `frames_json`、`transcripts_json`、`notes_json`、`visual_analysis_json` 或 Markdown。它可以被删除后重建，也可以在功能开关关闭时完全旁路，因此不会破坏原有视频处理与展示链路。
+
+```mermaid
+flowchart LR
+    Completed["完成任务或历史回填"] --> Read["读取任务 JSON 与媒体元数据"]
+    Read --> Hash["规范化并计算来源哈希"]
+    Hash --> Same{"来源与版本未变化？"}
+    Same -->|"是"| Skip["返回现有资产"]
+    Same -->|"否"| Parse["解析章节、原文、笔记和画面"]
+    Parse --> Chunk["按章节分块与内容哈希去重"]
+    Chunk --> Validate{"最低可用校验"}
+    Validate -->|"完整"| Ready["可用"]
+    Validate -->|"有可引用证据但有缺失"| Degraded["部分可用"]
+    Validate -->|"无可检索证据"| Failed["构建失败"]
+    Ready --> Query["只读知识服务"]
+    Degraded --> Query
+    Query --> Result["稳定 ID、命中文本、时间和画面引用"]
+```
+
+### 来源优先级与分块
+
+| 内容 | 来源与降级规则 | 检索单元 |
+| --- | --- | --- |
+| 资产标题 | 视频显示标题，缺失时使用安全文件名去扩展名 | 参与标题命中评分 |
+| 章节 | 优先 `narrative_structure`，兼容 `structure`；再降级到笔记或原文 | 每章一个 `chapter_summary`，不跨章节 |
+| 原文 | 只使用 `transcripts_json`，不以摘要冒充原话 | 同章相邻片段合并，目标 300–800 字符且最长 90 秒 |
+| 笔记 | `notes_json` 中已有标题、摘要与知识点 | 每个笔记一个 `note` 分块 |
+| 总体摘要 | 视觉摘要、Markdown 摘要或受控笔记拼接 | 每个资产最多一个 `video_summary` |
+| 画面 | `frames_json` 中的 `frame_id`、时间和受控相对 URL | 只保存引用与可用性，不复制图片二进制 |
+
+所有实体使用稳定 UUID；空白、纯标点和规范化后重复的文本不会进入检索。时间统一为秒并限制在视频时长内，媒体引用必须仍位于对应任务目录。
+
+### 一期关键词检索
+
+一期不生成 Embedding，也不调用模型重排，而是在明确的 `owner_scope` 与资产范围内做中文子串匹配。候选结果按以下可解释公式评分：
+
+```text
+final_score = 0.75 × keyword_relevance
+            + 0.15 × field_match
+            + 0.10 × evidence_completeness
+```
+
+- 标题、章节标题、内容标题和正文命中拥有不同字段权重；
+- 同时具备资产、内容类型、合法时间和画面引用的证据完整度更高；
+- 默认只检索 `ready` 与 `degraded` 当前版本，`building`、`failed` 和 `deleting` 不会泄漏到结果；
+- `%`、`_` 和 SQL 片段均按普通查询文本处理，调用方不能传入 SQL 或任意文件路径。
+
+---
+
 ## AI 工作流程
 
-SnapNote 当前采用确定性的流水线编排，不是多 Agent 系统，也没有 RAG 或向量数据库。这样的设计减少了 Demo 阶段的基础设施依赖，让每个处理阶段都可以独立记录、诊断和降级。
+SnapNote 当前采用确定性的流水线编排，不是多 Agent 系统，也没有生成式 RAG 或向量数据库。知识层先交付可验证的关键词检索与引用契约，为后续混合检索或问答助手保留边界；这样的设计减少了当前阶段的基础设施依赖，让每个处理阶段都可以独立记录、诊断和降级。
 
 ### ASR
 
@@ -363,6 +453,7 @@ flowchart LR
 | 样式 | Tailwind CSS 4 + 项目级 CSS | 响应式视觉系统 | 轻量、可维护，适合快速构建产品 Demo |
 | 后端 | FastAPI、Uvicorn | 异步 API 与自动文档 | 上传、SSE 和文件响应实现直接 |
 | ORM | SQLAlchemy 2 async、aiosqlite | 任务与阶段结果持久化 | 单机 Demo 无需独立数据库服务 |
+| 知识资产 | 版本化 SQLite 实体、稳定 UUID、来源哈希、受控关键词检索 | 规范章节、原文、分块与媒体引用 | 在不引入向量库的前提下先建立可重建、可审计的查询边界 |
 | 实时通信 | SSE / `sse-starlette` | 处理阶段与心跳推送 | 单向进度流比 WebSocket 更简单 |
 | 媒体处理 | ffmpeg、ffprobe | 元信息、音频与关键帧 | 格式支持成熟，命令行集成稳定 |
 | ASR | faster-whisper / MIMO-ASR | 带时间戳语音识别 | 本机权重低成本主路径，云端可选 |
@@ -388,6 +479,14 @@ flowchart LR
 | `GET` | `/api/snapnote/tasks/{task_id}/export/markdown` | 下载 Markdown |
 | `GET` | `/api/snapnote/tasks/{task_id}/video` | 获取原视频 |
 | `DELETE` | `/api/snapnote/tasks/{task_id}` | 删除数据库记录和任务目录 |
+| `GET` | `/api/snapnote/tasks/{task_id}/knowledge` | 获取知识资产构建状态 |
+| `POST` | `/api/snapnote/tasks/{task_id}/knowledge/rebuild` | 仅使用现有产物重建知识资产 |
+| `GET` | `/api/knowledge/assets` | 分页列出知识资产 |
+| `GET` | `/api/knowledge/assets/{asset_id}` | 获取资产摘要和章节目录 |
+| `POST` | `/api/knowledge/search` | 在受控范围内执行中文关键词检索 |
+| `GET` | `/api/knowledge/chapters/{chapter_id}` | 获取章节和关联画面 |
+| `GET` | `/api/knowledge/assets/{asset_id}/transcript` | 按时间范围读取原文 |
+| `GET` | `/api/knowledge/media/{media_id}` | 获取受控关键帧引用 |
 
 上传示例：
 
@@ -407,9 +506,41 @@ curl -X POST "http://127.0.0.1:43872/api/snapnote/tasks" \
 }
 ```
 
+范围内关键词检索示例：
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:43872/api/knowledge/search" `
+  -H "Content-Type: application/json" `
+  -d '{"query":"缩放点积注意力","asset_ids":["<asset-id>"],"content_types":["chapter_summary","transcript"],"top_k":8,"owner_scope":"local"}'
+```
+
+每条结果至少包含 `chunk_id`、`asset_id`、`asset_version_id`、内容类型、命中文本、相关度、来源状态，以及可用的章节、时间和关键帧引用。搜索词长度限制为 1–500 字符，`top_k` 为 1–20，单次显式资产范围最多 100 条。
+
+历史任务可先预览、再执行幂等回填；该命令只读取已有 JSON 和媒体元数据，不会调用任何 AI 服务：
+
+```powershell
+cd backend
+conda run -n snapnote python -m app.backfill_knowledge --dry-run
+conda run -n snapnote python -m app.backfill_knowledge --execute
+```
+
 ---
 
 ## 数据模型
+
+```mermaid
+flowchart TD
+    Task["SnapTask 事实快照"] --> Asset["KnowledgeAsset 稳定资产身份"]
+    Asset --> Version["KnowledgeAssetVersion 不可变版本"]
+    Asset --> Run["KnowledgeBuildRun 构建与回填记录"]
+    Version --> Chapter["KnowledgeChapter 章节"]
+    Version --> Transcript["KnowledgeTranscriptSegment 原文"]
+    Version --> Chunk["KnowledgeChunk 检索分块"]
+    Version --> Media["KnowledgeMedia 媒体引用"]
+    Chapter --> Chunk
+```
+
+应用启动时通过 `schema_migrations` 记录迁移版本，并为 SQLite 启用外键约束。知识资产与源任务一对一；版本内容写入后保持不可变，只有完整校验通过的新版本才会原子切换为当前版本。
 
 ### `snap_tasks`
 
@@ -425,6 +556,19 @@ curl -X POST "http://127.0.0.1:43872/api/snapnote/tasks" \
 
 记录每个阶段的名称、状态、JSON 结果、错误信息、开始时间与完成时间，便于诊断和后续实现单阶段重试。
 
+### 知识资产表
+
+| 表 | 职责 | 核心约束 |
+| --- | --- | --- |
+| `schema_migrations` | 记录数据库结构版本和应用时间 | 迁移版本唯一，重复启动幂等 |
+| `knowledge_assets` | 保存稳定资产身份、当前状态和当前版本 | `task_id` 唯一；删除源任务时级联清理 |
+| `knowledge_asset_versions` | 保存来源哈希、Schema/Builder 版本、摘要和时长 | 同资产相同来源与版本组合唯一；内容不可变 |
+| `knowledge_chapters` | 保存章节顺序、标题、概要和时间范围 | 同版本章节序号唯一，按时间升序 |
+| `knowledge_transcript_segments` | 保存未经摘要替代的原文片段 | 同版本来源序号唯一，保留内容哈希 |
+| `knowledge_chunks` | 保存 `video_summary`、`chapter_summary`、`transcript`、`note` 检索单元 | 来源引用必填，同版本相同内容哈希去重 |
+| `knowledge_media` | 保存关键帧相对引用、时间和可用性 | 不保存绝对路径或二进制，同版本 `frame_id` 唯一 |
+| `knowledge_build_runs` | 保存自动构建、回填和手动重建的状态与统计 | 同资产最多一个 `running` 构建，卡住运行可恢复 |
+
 ---
 
 ## 项目结构
@@ -438,11 +582,14 @@ SnapNote/
 │   │   ├── asr.py              # Whisper/MIMO-ASR Provider、分片、重试与进度
 │   │   ├── vision.py           # 流式镜头检测、质量评分、关键帧与动态代理
 │   │   ├── mimo_vision.py      # MiMo 多图、短视频和整片结构化分析
-│   │   ├── database.py         # SQLAlchemy 异步模型与数据库初始化
+│   │   ├── knowledge.py        # 知识构建、分块、版本、查询与删除治理
+│   │   ├── backfill_knowledge.py
+│   │   │                       # 历史知识资产预览与幂等回填 CLI
+│   │   ├── database.py         # SQLAlchemy 模型、迁移与完整性约束
 │   │   ├── config.py           # 环境变量、存储和 ffmpeg 探测
 │   │   ├── schemas.py          # API 请求与响应 Schema
 │   │   └── sse_manager.py      # 订阅者队列与近期事件历史
-│   ├── tests/                   # ASR、镜头算法与 MiMo 结构化输出测试
+│   ├── tests/                   # ASR、视觉、知识幂等、检索与删除测试
 │   ├── .env.example            # 后端配置模板
 │   └── requirements.txt        # Python 依赖
 ├── frontend/
@@ -456,11 +603,15 @@ SnapNote/
 │   ├── worker/                  # Vinext 本地 Worker 运行入口
 │   ├── public/                  # 图标与 Open Graph 资源
 │   └── tests/                   # Worker 服务端渲染与产品文案测试
-├── docs/images/                 # README 主视觉
+├── docs/
+│   ├── images/                  # README 主视觉
+│   └── SnapNote音视频处理*.md   # 流水线与时效优化技术方案
 ├── PRD/
-│   ├── SnapNote_PRD_v1.md       # 产品需求文档
-│   └── SnapNote_Web_Demo_PRD_v1.md
-│                                 # Web Demo 产品需求文档
+│   ├── PRD-DEV-001-SnapNote-知识资产化一期.md
+│   │                             # 当前知识资产化开发型 PRD
+│   ├── PRD-ROADMAP-001-SnapNote-未来产品规划.md
+│   │                             # 产品阶段规划
+│   └── SnapNote_*.md             # 基础产品、Web Demo 与资产页 PRD
 ├── storage/                     # SQLite 与任务文件，运行时生成且不提交
 ├── start-snapnote.cmd           # Windows 双击启动
 ├── stop-snapnote.cmd            # Windows 双击关闭
@@ -483,6 +634,11 @@ SnapNote/
 | `MAX_UPLOAD_SIZE_MB` | 否 | `2048` | 上传大小上限 |
 | `MAX_VIDEO_DURATION_SECONDS` | 否 | `3600` | 最大处理时长 |
 | `ENABLE_PIPELINE_PARALLELISM` | 否 | `1` | 是否并行执行音频转写与本地画面处理分支 |
+| `ENABLE_KNOWLEDGE_AUTO_BUILD` | 否 | `1` | 任务完成后是否自动派生知识资产 |
+| `ENABLE_KNOWLEDGE_SEARCH` | 否 | `1` | 是否启用只读关键词检索 |
+| `ENABLE_KNOWLEDGE_STATUS_UI` | 否 | `1` | 是否在任务详情响应中返回知识状态 |
+| `ENABLE_KNOWLEDGE_REBUILD` | 否 | `1` | 是否允许用户仅用现有产物重建知识资产 |
+| `KNOWLEDGE_OWNER_SCOPE` | 否 | `local` | 本地单用户知识范围标识 |
 | `DEFAULT_ASR_PROVIDER` | 否 | `whisper` | 未指定时使用的 ASR Provider |
 | `ENABLE_LOCAL_WHISPER` | 否 | `1` | 是否启用本地 Whisper |
 | `WHISPER_MODEL_SIZE` | 否 | `large-v3` | faster-whisper 模型规格 |
@@ -542,6 +698,9 @@ SnapNote/
 - **主要瓶颈**：本地 Whisper、场景扫描解码、PaddleOCR 与 MiMo 请求会消耗 GPU/CPU、网络和 Token。
 - **当前并发模型**：任务通过 FastAPI `BackgroundTasks` 在应用进程内执行，适合单机 Demo，不适合高并发生产环境。
 - **视觉成本控制**：本地低分辨率扫描免费；只上传最多 24 张 736px 关键帧，并仅给最多 4 个动态/不确定镜头补充无声短视频。
+- **知识构建成本**：只读取已有 SQLite 快照与媒体元数据，不重新解码视频，也不发起 ASR、OCR、MiMo 或 DeepSeek 请求；相同来源与版本直接跳过。
+- **检索边界**：查询先按所有者、资产状态、显式资产范围和内容类型过滤，再对最多 1000 个候选做可解释评分；单次最多返回 20 条结果。
+- **一期验收目标**：面向本地单用户、1000 条资产、10 万分块，目标为单资产读取 P95 ≤ 300 ms、范围内检索 P95 ≤ 1 秒。该目标仍需使用实际 10 条样本与规模数据持续评测。
 - **可扩展方向**：将任务编排迁移到独立队列，将 SQLite 升级为 PostgreSQL，将文件迁移到对象存储，并为 ASR/OCR 设置独立工作池。
 - **前端性能**：结果页优先加载关键帧缩略图；在线演示构建为 Cloudflare Worker 兼容 ESM。
 
@@ -554,6 +713,11 @@ SnapNote/
 - 文件大小在流式写入过程中累计校验，超限时删除已创建的任务目录。
 - API Key 只从后端环境变量读取，不返回给浏览器。
 - CORS 默认仅允许本地前端地址；部署真实后端时应改为实际可信域名。
+- 知识查询先做 `owner_scope`、状态和资产范围过滤；正文中的指令只被视为资料，不能改变服务权限。
+- 关键词查询使用参数化 SQL，并转义 `%`、`_` 与反斜杠；接口不接受 SQL、绝对路径或任意媒体路径。
+- 媒体 URL 解码后必须仍位于 `/storage/tasks/{task_id}/`，同时拒绝明文和编码后的路径穿越。
+- 删除时先把知识资产标记为 `deleting` 并立即移出检索，再清理文件和级联实体；文件清理失败会保留可重试状态。
+- 构建日志只记录任务标识、触发类型、数量、耗时和稳定错误码，不记录完整原文、查询正文、环境变量或密钥。
 - 当前 Demo 没有用户登录和任务级权限隔离，不应直接作为多租户公开文件服务。
 
 ---
@@ -579,6 +743,8 @@ conda run -n snapnote python -c "from app.main import app; print(app.title)"
 conda run -n snapnote python -m unittest discover -s tests -v
 ```
 
+知识测试覆盖完整构建、缺媒体降级、损坏 JSON 隔离、来源变化生成新版本、重复构建幂等、中文关键词与通配符转义、原文范围读取、媒体路径穿越和级联删除。当前完整回归为后端 23 项、前端服务端渲染 2 项，且前端 lint 与生产构建通过。
+
 ---
 
 ## 项目亮点
@@ -587,7 +753,9 @@ conda run -n snapnote python -m unittest discover -s tests -v
 2. **混合成本路线**：本地精确 ASR 与场景算法负责高频工作，MiMo 只处理筛选后的信息密集素材。
 3. **非 PPT 限定的视觉画像**：真实识别人物、动作、运镜、构图、剪辑节奏、爆款元素与 storyboard。
 4. **双模式交付**：同一套前端既可作为无需服务端的产品 Demo，也能连接本地多模态后端处理真实视频。
-5. **边缘友好前端**：Vinext 输出 Cloudflare Worker 兼容构建，同时保留 React App Router 的开发方式。
+5. **可重建知识边界**：旧 JSON 保持事实快照，新实体通过稳定 ID、来源哈希和不可变版本形成查询层，失败不污染原任务。
+6. **可引用而非黑盒搜索**：关键词命中同时返回章节、原文时间和画面引用，后续 AI 助手可以直接复用契约并回到原视频核验。
+7. **边缘友好前端**：Vinext 输出 Cloudflare Worker 兼容构建，同时保留 React App Router 的开发方式。
 
 ---
 
@@ -605,6 +773,13 @@ conda run -n snapnote python -m unittest discover -s tests -v
 - [x] pHash 去重、时间窗口对齐和 Markdown 导出
 - [x] 视频播放器、章节与笔记时间锚点联动
 - [x] 公开在线前端演示
+- [x] 版本化知识资产、稳定引用与自动构建
+- [x] 历史任务 dry-run、幂等回填、失败重试与强制重建
+- [x] 中文关键词检索与六类只读知识接口
+- [x] 知识状态、重建确认和删除一致性 UI
+- [ ] 使用 10 条真实样本完成知识资产人工抽验与规模性能基准
+- [ ] 引入 Embedding、混合检索和证据重排
+- [ ] 基于当前引用契约实现 MiMo 问答助手与 MCP 工具
 - [ ] 支持单帧删除、重复页面合并和标题编辑
 - [ ] 支持单阶段 OCR / ASR / 笔记重新执行
 - [ ] 引入独立任务队列、对象存储和 PostgreSQL
@@ -652,6 +827,22 @@ conda run -n snapnote python -m unittest discover -s tests -v
 ### 任务文件保存在哪里？
 
 默认位于仓库根目录的 `storage/tasks/{task_id}`，SQLite 位于 `storage/app.db`。这些运行时文件已被 `.gitignore` 排除。
+
+### 知识资产构建失败会让原视频任务失败吗？
+
+不会。知识资产是任务完成后的派生查询层，拥有独立的 `not_built / building / ready / degraded / failed / deleting` 状态。构建或重建失败时，原任务仍保持完成，旧的可用知识版本也不会被损坏。
+
+### 历史回填会重新调用模型或产生 API 费用吗？
+
+不会。`app.backfill_knowledge` 只读取现有 JSON、Markdown 和媒体元数据，不调用 Whisper、MIMO-ASR、OCR、MiMo 或 DeepSeek。建议先运行 `--dry-run`，确认候选与失败原因后再使用 `--execute`。
+
+### 为什么知识检索没有使用向量数据库？
+
+一期先建立稳定身份、来源、版本、范围过滤和引用契约，并交付中文关键词基线。这样可以先验证“命中能否回到原视频核验”，避免过早引入 Embedding 成本与双写复杂度；后续会在不改变返回契约的前提下增加混合检索。
+
+### 删除视频后知识数据如何处理？
+
+删除请求先把资产切换为 `deleting`，因此会立即退出默认检索；随后清理任务目录，并通过外键级联删除资产版本、章节、原文、分块、媒体和构建记录。文件占用导致清理失败时，接口会保留可重试状态，不会重新开放检索。
 
 ---
 

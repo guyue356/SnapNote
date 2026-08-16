@@ -6,17 +6,38 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiofiles
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from sse_starlette.sse import EventSourceResponse
 
-from .config import DEFAULT_ASR_PROVIDER, FRONTEND_ORIGIN, MAX_UPLOAD_SIZE_MB, STORAGE_ROOT, TASKS_DIR
-from .database import SnapTask, async_session, init_db
+from .config import (
+    DEFAULT_ASR_PROVIDER,
+    ENABLE_KNOWLEDGE_REBUILD,
+    ENABLE_KNOWLEDGE_SEARCH,
+    ENABLE_KNOWLEDGE_STATUS_UI,
+    FRONTEND_ORIGIN,
+    MAX_UPLOAD_SIZE_MB,
+    STORAGE_ROOT,
+    TASKS_DIR,
+)
+from .database import KnowledgeAsset, SnapTask, async_session, init_db
+from .knowledge import (
+    KnowledgeError,
+    build_knowledge_asset,
+    get_asset,
+    get_chapter,
+    get_keyframe,
+    get_task_knowledge_status,
+    get_transcript,
+    list_assets as list_knowledge_assets,
+    remove_knowledge_for_task,
+    search_knowledge,
+)
 from .pipeline import new_processing_state, reset_task, run_pipeline
-from .schemas import RetryRequest, TaskCreated
+from .schemas import KnowledgeSearchRequest, RetryRequest, TaskCreated
 from .sse_manager import sse_manager
 
 
@@ -36,22 +57,28 @@ def _safe_filename(filename: str) -> str:
     return "".join(char for char in name if char.isalnum() or char in " ._-()")[:180] or "video.mp4"
 
 
-def _task_payload(task: SnapTask):
-    frames = json.loads(task.frames_json or "[]")
+def _json_payload(raw: str | None, fallback):
     try:
-        processing_state = json.loads(task.processing_state_json or "{}")
-    except json.JSONDecodeError:
-        processing_state = {}
+        value = json.loads(raw or json.dumps(fallback))
+        return value if isinstance(value, type(fallback)) else fallback
+    except (json.JSONDecodeError, TypeError):
+        return fallback
+
+
+def _task_payload(task: SnapTask, knowledge_asset: dict | None = None):
+    frames = _json_payload(task.frames_json, [])
+    processing_state = _json_payload(task.processing_state_json, {})
     return {
         "id": task.id, "filename": task.filename, "title": Path(task.filename).stem,
         "duration": task.duration, "status": task.status, "current_stage": task.current_stage,
         "progress": task.progress, "asr_provider": task.asr_provider, "note_style": task.note_style,
         "error_message": task.error_message, "frame_count": len(frames), "frames": frames,
-        "transcript_segments": json.loads(task.transcripts_json or "[]"),
-        "note_blocks": json.loads(task.notes_json or "[]"), "final_markdown": task.final_markdown,
-        "visual_analysis": json.loads(task.visual_analysis_json or "{}"),
+        "transcript_segments": _json_payload(task.transcripts_json, []),
+        "note_blocks": _json_payload(task.notes_json, []), "final_markdown": task.final_markdown,
+        "visual_analysis": _json_payload(task.visual_analysis_json, {}),
         "processing_state": processing_state,
         "video_url": f"/api/snapnote/tasks/{task.id}/video", "created_at": task.created_at,
+        "knowledge_asset": knowledge_asset if ENABLE_KNOWLEDGE_STATUS_UI else None,
     }
 
 
@@ -95,7 +122,17 @@ async def create_task(background_tasks: BackgroundTasks, video: UploadFile = Fil
 async def list_tasks():
     async with async_session() as db:
         rows = (await db.execute(select(SnapTask).order_by(SnapTask.created_at.desc()))).scalars().all()
-        return [_task_payload(task) for task in rows]
+        knowledge = (await db.execute(select(KnowledgeAsset))).scalars().all()
+        by_task = {asset.task_id: {
+            "asset_id": asset.id, "status": asset.status,
+            "current_version_id": asset.current_version_id,
+            "missing_items": _json_payload(asset.missing_items_json, []),
+            "error_summary": asset.error_summary, "updated_at": asset.updated_at,
+        } for asset in knowledge}
+        return [_task_payload(task, by_task.get(task.id, {
+            "asset_id": None, "status": "not_built", "current_version_id": None,
+            "missing_items": [], "error_summary": None,
+        })) for task in rows]
 
 
 @app.get("/api/snapnote/tasks/{task_id}")
@@ -104,7 +141,102 @@ async def get_task(task_id: str):
         task = await db.get(SnapTask, task_id)
         if not task:
             raise HTTPException(404, "任务不存在")
-        return _task_payload(task)
+        knowledge = await get_task_knowledge_status(task_id) if ENABLE_KNOWLEDGE_STATUS_UI else None
+        return _task_payload(task, knowledge)
+
+
+@app.get("/api/snapnote/tasks/{task_id}/knowledge")
+async def task_knowledge_status(task_id: str):
+    async with async_session() as db:
+        if not await db.get(SnapTask, task_id):
+            raise HTTPException(404, "任务不存在")
+    return await get_task_knowledge_status(task_id)
+
+
+@app.post("/api/snapnote/tasks/{task_id}/knowledge/rebuild")
+async def rebuild_task_knowledge(task_id: str):
+    if not ENABLE_KNOWLEDGE_REBUILD:
+        raise HTTPException(503, "知识资产重建功能未启用")
+    async with async_session() as db:
+        task = await db.get(SnapTask, task_id)
+        if not task:
+            raise HTTPException(404, "任务不存在")
+        asset = (await db.execute(select(KnowledgeAsset).where(
+            KnowledgeAsset.task_id == task_id
+        ))).scalar_one_or_none()
+        if asset and asset.status in {"building", "deleting"}:
+            raise HTTPException(409, "知识资产正在处理，请勿重复提交")
+    result = await build_knowledge_asset(task_id, trigger="manual", force=True)
+    if result["status"] == "failed":
+        raise HTTPException(422, result.get("error_summary", "知识资产构建失败"))
+    return result
+
+
+@app.get("/api/knowledge/assets")
+async def knowledge_assets(
+    status: str | None = None,
+    title: str | None = None,
+    owner_scope: str = "local",
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    return await list_knowledge_assets(
+        status=status, title_query=title, owner_scope=owner_scope, limit=limit, offset=offset
+    )
+
+
+@app.get("/api/knowledge/assets/{asset_id}")
+async def knowledge_asset_detail(asset_id: str, owner_scope: str = "local"):
+    result = await get_asset(asset_id, owner_scope)
+    if not result:
+        raise HTTPException(404, "未找到或不可访问")
+    return result
+
+
+@app.post("/api/knowledge/search")
+async def knowledge_search(payload: KnowledgeSearchRequest):
+    if not ENABLE_KNOWLEDGE_SEARCH:
+        raise HTTPException(503, "知识检索功能未启用")
+    try:
+        return await search_knowledge(
+            payload.query, asset_ids=payload.asset_ids,
+            content_types=payload.content_types, top_k=payload.top_k,
+            owner_scope=payload.owner_scope,
+        )
+    except KnowledgeError as error:
+        raise HTTPException(422, {"code": error.code, "summary": error.summary}) from None
+
+
+@app.get("/api/knowledge/chapters/{chapter_id}")
+async def knowledge_chapter_detail(chapter_id: str, owner_scope: str = "local"):
+    result = await get_chapter(chapter_id, owner_scope)
+    if not result:
+        raise HTTPException(404, "未找到或不可访问")
+    return result
+
+
+@app.get("/api/knowledge/assets/{asset_id}/transcript")
+async def knowledge_transcript(
+    asset_id: str,
+    start_time: float = Query(0, ge=0),
+    end_time: float | None = Query(None, gt=0),
+    owner_scope: str = "local",
+):
+    try:
+        result = await get_transcript(asset_id, start_time, end_time, owner_scope)
+    except KnowledgeError as error:
+        raise HTTPException(422, {"code": error.code, "summary": error.summary}) from None
+    if not result:
+        raise HTTPException(404, "未找到或不可访问")
+    return result
+
+
+@app.get("/api/knowledge/media/{media_id}")
+async def knowledge_media(media_id: str, owner_scope: str = "local"):
+    result = await get_keyframe(media_id, owner_scope)
+    if not result:
+        raise HTTPException(404, "未找到或不可访问")
+    return result
 
 
 @app.get("/api/snapnote/tasks/{task_id}/stream")
@@ -164,10 +296,25 @@ async def delete_task(task_id: str):
         task = await db.get(SnapTask, task_id)
         if not task:
             raise HTTPException(404, "任务不存在")
-        await db.delete(task)
+        asset = (await db.execute(select(KnowledgeAsset).where(
+            KnowledgeAsset.task_id == task_id
+        ))).scalar_one_or_none()
+        if asset:
+            asset.status = "deleting"
         await db.commit()
     target = (TASKS_DIR / task_id).resolve()
-    if TASKS_DIR.resolve() in target.parents:
-        shutil.rmtree(target, ignore_errors=True)
+    if TASKS_DIR.resolve() not in target.parents:
+        raise HTTPException(500, "任务目录校验失败，知识资产已停止参与检索")
+    try:
+        if target.exists():
+            shutil.rmtree(target)
+    except OSError:
+        raise HTTPException(503, "视频已停止提供知识检索，部分数据清理未完成，可重试") from None
+    async with async_session() as db:
+        task = await db.get(SnapTask, task_id)
+        if task:
+            await remove_knowledge_for_task(task_id, db)
+            await db.delete(task)
+            await db.commit()
     sse_manager.clear(task_id)
     return {"ok": True}

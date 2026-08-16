@@ -24,3 +24,13 @@ class TaskListItem(BaseModel):
 
 class RetryRequest(BaseModel):
     asr_provider: Literal["mimo", "whisper"] | None = None
+
+
+class KnowledgeSearchRequest(BaseModel):
+    query: str
+    asset_ids: list[str] | None = None
+    content_types: list[
+        Literal["video_summary", "chapter_summary", "transcript", "note"]
+    ] | None = None
+    top_k: int = 8
+    owner_scope: str = "local"

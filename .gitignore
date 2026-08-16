@@ -21,6 +21,11 @@ __tests__/
 coverage/
 .coverage
 htmlcov/
+# Keep the phase-one knowledge contract tests with the implementation while
+# retaining the repository's existing local-test convention.
+!backend/tests/
+backend/tests/*
+!backend/tests/test_knowledge.py
 
 # Runtime data
 storage/app.db

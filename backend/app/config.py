@@ -18,6 +18,17 @@ ENABLE_PIPELINE_PARALLELISM = os.getenv("ENABLE_PIPELINE_PARALLELISM", "1").lowe
     "1", "true", "yes", "on"
 }
 
+
+def _flag(name: str, default: str = "1") -> bool:
+    return os.getenv(name, default).lower() in {"1", "true", "yes", "on"}
+
+
+ENABLE_KNOWLEDGE_AUTO_BUILD = _flag("ENABLE_KNOWLEDGE_AUTO_BUILD")
+ENABLE_KNOWLEDGE_SEARCH = _flag("ENABLE_KNOWLEDGE_SEARCH")
+ENABLE_KNOWLEDGE_STATUS_UI = _flag("ENABLE_KNOWLEDGE_STATUS_UI")
+ENABLE_KNOWLEDGE_REBUILD = _flag("ENABLE_KNOWLEDGE_REBUILD")
+KNOWLEDGE_OWNER_SCOPE = os.getenv("KNOWLEDGE_OWNER_SCOPE", "local").strip() or "local"
+
 DEFAULT_ASR_PROVIDER = os.getenv("DEFAULT_ASR_PROVIDER", "whisper").strip().lower()
 if DEFAULT_ASR_PROVIDER not in {"whisper", "mimo"}:
     DEFAULT_ASR_PROVIDER = "whisper"

@@ -6,7 +6,17 @@ import { useParams, useRouter } from "next/navigation";
 import BrandHeader from "../../components/BrandHeader";
 import SlideVisual from "../../components/SlideVisual";
 import { exportMarkdown, formatDuration, getTask, getVideoUrl, SAMPLE_NOTES, saveTask, type SnapTask } from "../../lib/demo";
-import { API_BASE, backendAsset, fetchBackendTask, hasBackend, toLocalTask, type BackendVisualAnalysis } from "../../lib/api";
+import {
+  API_BASE,
+  backendAsset,
+  fetchBackendTask,
+  fetchKnowledgeStatus,
+  hasBackend,
+  rebuildKnowledge,
+  toLocalTask,
+  type BackendVisualAnalysis,
+  type KnowledgeAssetStatus,
+} from "../../lib/api";
 
 type TranscriptSegment = {
   start: number;
@@ -41,6 +51,9 @@ export default function ResultPage() {
   const [transcript, setTranscript] = useState<TranscriptSegment[]>([]);
   const [loadError, setLoadError] = useState("");
   const [seekError, setSeekError] = useState("");
+  const [knowledgeStatus, setKnowledgeStatus] = useState<KnowledgeAssetStatus>();
+  const [knowledgeError, setKnowledgeError] = useState("");
+  const [knowledgeBusy, setKnowledgeBusy] = useState(false);
 
   useEffect(() => {
     if (hasBackend) {
@@ -49,6 +62,7 @@ export default function ResultPage() {
         setVideoUrl(backendAsset(remote.video_url));
         setVisualAnalysis(remote.visual_analysis || {});
         setTranscript(remote.transcript_segments || []);
+        if (remote.knowledge_asset) setKnowledgeStatus(remote.knowledge_asset);
         const structure = remote.visual_analysis?.narrative_structure || remote.visual_analysis?.structure || [];
         if (structure.length) {
           setChapters(structure.map((section) => {
@@ -81,6 +95,19 @@ export default function ResultPage() {
     }
     if (!getTask(params.id)) router.replace("/");
   }, [params.id, router]);
+
+  useEffect(() => {
+    if (!hasBackend || knowledgeStatus?.status !== "building") return;
+    const timer = window.setInterval(() => {
+      fetchKnowledgeStatus(params.id)
+        .then((status) => {
+          setKnowledgeStatus(status);
+          setKnowledgeError("");
+        })
+        .catch((error: Error) => setKnowledgeError(error.message));
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [knowledgeStatus?.status, params.id]);
 
   useEffect(() => () => tickerRef.current && window.clearInterval(tickerRef.current), []);
 
@@ -155,6 +182,54 @@ export default function ResultPage() {
     router.push(`/tasks/${task.id}/processing`);
   }
 
+  async function rebuildKnowledgeAsset() {
+    if (!task || !knowledgeStatus || knowledgeBusy) return;
+    if (knowledgeStatus.status === "ready" && !window.confirm(
+      "将重新解析现有章节、原文和画面，并重建检索索引。\n\n不会重新运行语音识别或 MiMo 视觉分析，也不会覆盖原视频任务结果。"
+    )) return;
+    const previous = knowledgeStatus;
+    setKnowledgeBusy(true);
+    setKnowledgeError("");
+    setKnowledgeStatus({ ...previous, status: "building" });
+    try {
+      setKnowledgeStatus(await rebuildKnowledge(task.id));
+    } catch (error) {
+      setKnowledgeStatus(previous);
+      setKnowledgeError(error instanceof Error ? error.message : "暂时无法开始重新构建，请稍后重试");
+    } finally {
+      setKnowledgeBusy(false);
+    }
+  }
+
+  async function deleteSourceAsset() {
+    if (!task || knowledgeBusy || !window.confirm(
+      "确认删除这个视频资产？\n\n原视频、处理结果和关联知识数据都会被清理，且无法恢复。"
+    )) return;
+    setKnowledgeBusy(true);
+    setKnowledgeError("");
+    if (knowledgeStatus) setKnowledgeStatus({ ...knowledgeStatus, status: "deleting" });
+    try {
+      const response = await fetch(`${API_BASE}/api/snapnote/tasks/${task.id}`, { method: "DELETE" });
+      if (!response.ok) throw new Error("删除清理未完成，请稍后重试");
+      router.push("/");
+    } catch (error) {
+      setKnowledgeError(error instanceof Error ? error.message : "删除清理未完成，请稍后重试");
+      if (hasBackend) fetchKnowledgeStatus(task.id).then(setKnowledgeStatus).catch(() => undefined);
+      setKnowledgeBusy(false);
+    }
+  }
+
+  const knowledgeCopy = knowledgeStatus ? {
+    not_built: { label: "未构建", detail: "尚未生成可检索知识资产" },
+    building: { label: "构建中", detail: "正在整理章节、原文与检索索引…" },
+    ready: { label: "可用", detail: knowledgeStatus.error_summary
+      ? `当前版本仍可用；最近一次重建失败：${knowledgeStatus.error_summary}`
+      : "可供后续搜索与 AI 助手使用" },
+    degraded: { label: "部分可用", detail: `知识资产可用，但部分内容缺失：${knowledgeStatus.missing_items.join("、") || "部分证据"}` },
+    failed: { label: "构建失败", detail: `知识资产构建失败：${knowledgeStatus.error_summary || "现有内容无法形成可检索证据"}` },
+    deleting: { label: "删除中", detail: "正在清理知识数据…" },
+  }[knowledgeStatus.status] : undefined;
+
   if (loadError) {
     return (
       <main className="site-shell result-page">
@@ -185,10 +260,23 @@ export default function ResultPage() {
             </div>
             <h1>{task.title}</h1>
             <p>{formatDuration(task.duration)} · {chapters.length} 个章节 · {visualAnalysis.provider || "多模态流水线"}</p>
+            {knowledgeStatus && knowledgeCopy && (
+              <div className={`knowledge-status knowledge-${knowledgeStatus.status}`} role="status">
+                <span>知识资产：<strong>{knowledgeCopy.label}</strong></span>
+                <small>{knowledgeCopy.detail}</small>
+                {!(["building", "deleting"] as string[]).includes(knowledgeStatus.status) && (
+                  <button type="button" onClick={rebuildKnowledgeAsset} disabled={knowledgeBusy}>
+                    {knowledgeStatus.status === "not_built" ? "开始构建" : "重新构建"}
+                  </button>
+                )}
+              </div>
+            )}
+            {knowledgeError && <p className="knowledge-status-error" role="alert">{knowledgeError}</p>}
           </div>
           <div>
             <button className="secondary-button" type="button" onClick={regenerate}>↻ 重新生成</button>
             <button className="dark-button" type="button" onClick={() => hasBackend ? window.location.assign(`${API_BASE}/api/snapnote/tasks/${task.id}/export/markdown`) : exportMarkdown(task)}>↓ 导出 Markdown</button>
+            {hasBackend && <button className="danger-button" type="button" onClick={deleteSourceAsset} disabled={knowledgeBusy}>删除视频</button>}
           </div>
         </div>
       </section>

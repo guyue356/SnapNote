@@ -34,6 +34,15 @@ export type BackendVisualAnalysis = {
   provider?: string;
 };
 
+export type KnowledgeAssetStatus = {
+  asset_id: string | null;
+  status: "not_built" | "building" | "ready" | "degraded" | "failed" | "deleting";
+  current_version_id: string | null;
+  missing_items: string[];
+  error_summary?: string | null;
+  updated_at?: string;
+};
+
 export type BackendTask = {
   id: string;
   filename: string;
@@ -54,6 +63,7 @@ export type BackendTask = {
   video_url: string;
   created_at: string;
   processing_state?: Record<string, ProcessingBranchState>;
+  knowledge_asset?: KnowledgeAssetStatus | null;
 };
 
 export function toLocalTask(task: BackendTask): SnapTask {
@@ -110,6 +120,28 @@ export async function fetchBackendTasks(): Promise<BackendTask[]> {
   const response = await fetch(`${API_BASE}/api/snapnote/tasks`, { cache: "no-store" });
   if (!response.ok) throw new Error("无法读取任务列表");
   return response.json();
+}
+
+export async function fetchKnowledgeStatus(id: string): Promise<KnowledgeAssetStatus> {
+  const response = await fetch(`${API_BASE}/api/snapnote/tasks/${id}/knowledge`, { cache: "no-store" });
+  if (!response.ok) throw new Error("知识状态暂不可用，不影响视频浏览");
+  return response.json();
+}
+
+export async function rebuildKnowledge(id: string): Promise<KnowledgeAssetStatus> {
+  const response = await fetch(`${API_BASE}/api/snapnote/tasks/${id}/knowledge/rebuild`, { method: "POST" });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(typeof payload.detail === "string" ? payload.detail : "暂时无法开始重新构建，请稍后重试");
+  }
+  const payload = await response.json();
+  return {
+    asset_id: payload.asset_id,
+    current_version_id: payload.asset_version_id,
+    status: payload.status,
+    missing_items: payload.missing_items || [],
+    error_summary: null,
+  };
 }
 
 export function backendAsset(path: string) {
