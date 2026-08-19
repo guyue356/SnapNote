@@ -2,6 +2,7 @@ import asyncio
 import base64
 import http.client
 import json
+import random
 import time
 import urllib.error
 import urllib.request
@@ -53,23 +54,44 @@ def _parse_json_content(content: str) -> dict:
     return parsed
 
 
-def _request_json_sync(messages: list[dict], purpose: str, max_tokens: int = 5000):
-    if not MIMO_API_KEY:
+def _retry_delay(attempt: int, headers=None) -> float:
+    retry_after = headers.get("Retry-After") if headers else None
+    try:
+        base = float(retry_after) if retry_after else 2 ** (attempt - 1)
+    except (TypeError, ValueError):
+        base = 2 ** (attempt - 1)
+    return min(30.0, max(1.0, base) + random.uniform(0.0, 0.5))
+
+
+def _request_json_sync(
+    messages: list[dict],
+    purpose: str,
+    max_tokens: int = 5000,
+    *,
+    api_key: str = MIMO_API_KEY,
+    base_url: str = MIMO_BASE_URL,
+    model: str = MIMO_VISION_MODEL,
+    request_headers: dict | None = None,
+    timeout: int = MIMO_VISION_TIMEOUT_SECONDS,
+    max_attempts: int = MIMO_VISION_MAX_ATTEMPTS,
+):
+    if not api_key:
         raise RuntimeError("MIMO_API_KEY is not set. Add it to backend/.env.")
     body = json.dumps({
-        "model": MIMO_VISION_MODEL,
+        "model": model,
         "messages": messages,
         "response_format": {"type": "json_object"},
         "temperature": 0.1,
         "max_completion_tokens": max_tokens,
     }, ensure_ascii=False).encode("utf-8")
-    attempts = max(1, int(MIMO_VISION_MAX_ATTEMPTS))
-    timeout = max(30, int(MIMO_VISION_TIMEOUT_SECONDS))
+    attempts = max(1, int(max_attempts))
+    timeout = max(30, int(timeout))
+    headers = request_headers or {"api-key": api_key, "Content-Type": "application/json"}
     for attempt in range(1, attempts + 1):
         request = urllib.request.Request(
-            f"{MIMO_BASE_URL}/chat/completions",
+            f"{base_url}/chat/completions",
             data=body,
-            headers={"api-key": MIMO_API_KEY, "Content-Type": "application/json"},
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -82,9 +104,7 @@ def _request_json_sync(messages: list[dict], purpose: str, max_tokens: int = 500
                 raise RuntimeError(
                     f"MiMo {purpose} HTTP {error.code}: {response_body[:500]}"
                 ) from error
-            retry_after = error.headers.get("Retry-After")
-            delay = float(retry_after) if retry_after else 2 ** (attempt - 1)
-            time.sleep(min(30, max(1, delay)))
+            time.sleep(_retry_delay(attempt, error.headers))
         except (
             http.client.RemoteDisconnected,
             ConnectionResetError,
@@ -95,9 +115,15 @@ def _request_json_sync(messages: list[dict], purpose: str, max_tokens: int = 500
                 raise RuntimeError(
                     f"MiMo {purpose} connection failed after {attempts} attempts: {error}"
                 ) from error
-            time.sleep(min(30, 2 ** (attempt - 1)))
+            time.sleep(_retry_delay(attempt))
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
-            raise RuntimeError(f"Unexpected MiMo {purpose} response") from error
+            if attempt == attempts:
+                raise RuntimeError(f"Unexpected model {purpose} response") from error
+            time.sleep(_retry_delay(attempt))
+        except RuntimeError as error:
+            if attempt == attempts:
+                raise
+            time.sleep(_retry_delay(attempt))
     raise RuntimeError(f"MiMo {purpose} request failed")
 
 

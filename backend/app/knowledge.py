@@ -854,6 +854,7 @@ async def search_knowledge(
             score = round(0.75 * keyword + 0.15 * field_score + 0.10 * evidence, 6)
             results.append({
                 "chunk_id": chunk.id, "asset_id": asset.id,
+                "task_id": asset.task_id,
                 "asset_version_id": version.id, "asset_title": asset.title,
                 "content_type": chunk.content_type,
                 "chapter_id": chapter.id if chapter else None,

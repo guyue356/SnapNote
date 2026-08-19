@@ -108,6 +108,7 @@ class KnowledgeAssetIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(result["total"], 0)
         hit = result["results"][0]
         self.assertEqual(hit["asset_id"], first["asset_id"])
+        self.assertEqual(hit["task_id"], "task-ready")
         self.assertEqual(hit["asset_version_id"], first["asset_version_id"])
         self.assertIsNotNone(hit["chunk_id"])
         self.assertGreaterEqual(hit["score"], 0)

@@ -86,6 +86,9 @@ MIMO_VISION_REQUIRED = os.getenv("MIMO_VISION_REQUIRED", "0").lower() in {
     "1", "true", "yes", "on"
 }
 MIMO_VISION_MODEL = os.getenv("MIMO_VISION_MODEL", "mimo-v2.5")
+DEFAULT_NOTE_MODEL = os.getenv("DEFAULT_NOTE_MODEL", "mimo").strip().lower()
+if DEFAULT_NOTE_MODEL not in {"mimo", "deepseek"}:
+    DEFAULT_NOTE_MODEL = "mimo"
 MIMO_VISION_IMAGE_BATCH_SIZE = int(os.getenv("MIMO_VISION_IMAGE_BATCH_SIZE", "8"))
 MIMO_VISION_CONCURRENCY = int(os.getenv("MIMO_VISION_CONCURRENCY", "2"))
 MIMO_VISION_TIMEOUT_SECONDS = int(os.getenv("MIMO_VISION_TIMEOUT_SECONDS", "180"))

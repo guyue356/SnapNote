@@ -15,6 +15,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from .config import (
     DEFAULT_ASR_PROVIDER,
+    DEFAULT_NOTE_MODEL,
     ENABLE_KNOWLEDGE_REBUILD,
     ENABLE_KNOWLEDGE_SEARCH,
     ENABLE_KNOWLEDGE_STATUS_UI,
@@ -72,6 +73,7 @@ def _task_payload(task: SnapTask, knowledge_asset: dict | None = None):
         "id": task.id, "filename": task.filename, "title": Path(task.filename).stem,
         "duration": task.duration, "status": task.status, "current_stage": task.current_stage,
         "progress": task.progress, "asr_provider": task.asr_provider, "note_style": task.note_style,
+        "note_model": task.note_model,
         "error_message": task.error_message, "frame_count": len(frames), "frames": frames,
         "transcript_segments": _json_payload(task.transcripts_json, []),
         "note_blocks": _json_payload(task.notes_json, []), "final_markdown": task.final_markdown,
@@ -88,7 +90,13 @@ async def health():
 
 
 @app.post("/api/snapnote/tasks", response_model=TaskCreated)
-async def create_task(background_tasks: BackgroundTasks, video: UploadFile = File(...), asr_provider: str = Form(DEFAULT_ASR_PROVIDER), note_style: str = Form("classroom")):
+async def create_task(
+    background_tasks: BackgroundTasks,
+    video: UploadFile = File(...),
+    asr_provider: str = Form(DEFAULT_ASR_PROVIDER),
+    note_style: str = Form("classroom"),
+    note_model: str = Form(DEFAULT_NOTE_MODEL),
+):
     suffix = Path(video.filename or "").suffix.lower()
     if suffix not in {".mp4", ".mov", ".webm"}:
         raise HTTPException(415, "仅支持 MP4、MOV 和 WebM 视频")
@@ -110,7 +118,18 @@ async def create_task(background_tasks: BackgroundTasks, video: UploadFile = Fil
         raise
 
     async with async_session() as db:
-        task = SnapTask(id=task_id, filename=safe_name, video_path=str(video_path), status="queued", current_stage="upload_complete", progress=3, asr_provider=asr_provider if asr_provider in {"mimo", "whisper"} else DEFAULT_ASR_PROVIDER, note_style=note_style if note_style in {"classroom", "meeting"} else "classroom", processing_state_json=json.dumps(new_processing_state(), ensure_ascii=False))
+        task = SnapTask(
+            id=task_id,
+            filename=safe_name,
+            video_path=str(video_path),
+            status="queued",
+            current_stage="upload_complete",
+            progress=3,
+            asr_provider=asr_provider if asr_provider in {"mimo", "whisper"} else DEFAULT_ASR_PROVIDER,
+            note_style=note_style if note_style in {"classroom", "meeting"} else "classroom",
+            note_model=note_model if note_model in {"mimo", "deepseek"} else DEFAULT_NOTE_MODEL,
+            processing_state_json=json.dumps(new_processing_state(), ensure_ascii=False),
+        )
         db.add(task)
         await db.commit()
     await sse_manager.emit(task_id, "upload_complete", {"stage": "upload_complete", "progress": 3, "title": "上传完成", "message": "视频已安全保存"})

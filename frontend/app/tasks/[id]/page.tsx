@@ -1,11 +1,11 @@
 "use client";
 /* eslint-disable @next/next/no-img-element */
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import BrandHeader from "../../components/BrandHeader";
 import SlideVisual from "../../components/SlideVisual";
-import { exportMarkdown, formatDuration, getTask, getVideoUrl, SAMPLE_NOTES, saveTask, type SnapTask } from "../../lib/demo";
+import { deleteLocalTask, exportMarkdown, formatDuration, getTask, getVideoUrl, SAMPLE_NOTES, saveTask, type SnapTask } from "../../lib/demo";
 import {
   API_BASE,
   backendAsset,
@@ -41,8 +41,10 @@ export default function ResultPage() {
   const tickerRef = useRef<number | undefined>(undefined);
   const skeletonRef = useRef<HTMLElement>(null);
   const chapterRefs = useRef<Array<HTMLElement | null>>([]);
-  const [task, setTask] = useState<SnapTask | undefined>(() => typeof window === "undefined" || hasBackend ? undefined : getTask(params.id));
-  const [videoUrl, setVideoUrl] = useState(() => typeof window === "undefined" || hasBackend ? "" : getVideoUrl(params.id));
+  const initialSeekRef = useRef<number | null>(null);
+  const initialSeekAppliedRef = useRef(false);
+  const [task, setTask] = useState<SnapTask>();
+  const [videoUrl, setVideoUrl] = useState("");
   const [currentTime, setCurrentTime] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
@@ -51,9 +53,19 @@ export default function ResultPage() {
   const [transcript, setTranscript] = useState<TranscriptSegment[]>([]);
   const [loadError, setLoadError] = useState("");
   const [seekError, setSeekError] = useState("");
+  const [seekNotice, setSeekNotice] = useState("");
   const [knowledgeStatus, setKnowledgeStatus] = useState<KnowledgeAssetStatus>();
   const [knowledgeError, setKnowledgeError] = useState("");
   const [knowledgeBusy, setKnowledgeBusy] = useState(false);
+
+  useEffect(() => {
+    const rawTime = new URLSearchParams(window.location.search).get("t");
+    const parsedTime = rawTime === null ? Number.NaN : Number(rawTime);
+    initialSeekRef.current = Number.isFinite(parsedTime) && parsedTime >= 0 ? parsedTime : null;
+    initialSeekAppliedRef.current = false;
+    const timer = window.setTimeout(() => setSeekNotice(""), 0);
+    return () => window.clearTimeout(timer);
+  }, [params.id]);
 
   useEffect(() => {
     if (hasBackend) {
@@ -93,7 +105,16 @@ export default function ResultPage() {
       }).catch(() => setLoadError("视频资产暂时无法读取，请返回后重试。"));
       return;
     }
-    if (!getTask(params.id)) router.replace("/");
+    const localTask = getTask(params.id);
+    if (!localTask) {
+      router.replace("/");
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setTask(localTask);
+      setVideoUrl(getVideoUrl(params.id));
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [params.id, router]);
 
   useEffect(() => {
@@ -110,6 +131,26 @@ export default function ResultPage() {
   }, [knowledgeStatus?.status, params.id]);
 
   useEffect(() => () => tickerRef.current && window.clearInterval(tickerRef.current), []);
+
+  const applyInitialSeek = useCallback((video?: HTMLVideoElement) => {
+    const requested = initialSeekRef.current;
+    if (!task || requested === null || initialSeekAppliedRef.current) return;
+    const knownDuration = video && Number.isFinite(video.duration) && video.duration > 0 ? video.duration : task.duration;
+    const target = knownDuration > 0 ? Math.min(requested, knownDuration) : requested;
+    try {
+      if (video) video.currentTime = target;
+      setCurrentTime(target);
+      initialSeekAppliedRef.current = true;
+      setSeekNotice(`已定位到 ${formatDuration(target)}`);
+    } catch {
+      setSeekError("暂时无法定位搜索结果，请重试。");
+    }
+  }, [task]);
+
+  useEffect(() => {
+    if (!task || initialSeekAppliedRef.current || initialSeekRef.current === null) return;
+    if (!videoUrl || (videoRef.current && videoRef.current.readyState >= 1)) applyInitialSeek(videoRef.current || undefined);
+  }, [applyInitialSeek, task, videoUrl]);
 
   const currentIndex = chapters.reduce((active, chapter, index) => currentTime >= chapter.time ? index : active, chapters.length ? 0 : -1);
 
@@ -133,6 +174,7 @@ export default function ResultPage() {
 
   function seek(seconds: number, autoplay = true) {
     setSeekError("");
+    setSeekNotice("");
     setCurrentTime(seconds);
     if (videoRef.current) {
       try {
@@ -205,13 +247,18 @@ export default function ResultPage() {
     if (!task || knowledgeBusy || !window.confirm(
       "确认删除这个视频资产？\n\n原视频、处理结果和关联知识数据都会被清理，且无法恢复。"
     )) return;
+    if (!hasBackend) {
+      deleteLocalTask(task.id);
+      router.push("/notes");
+      return;
+    }
     setKnowledgeBusy(true);
     setKnowledgeError("");
     if (knowledgeStatus) setKnowledgeStatus({ ...knowledgeStatus, status: "deleting" });
     try {
       const response = await fetch(`${API_BASE}/api/snapnote/tasks/${task.id}`, { method: "DELETE" });
       if (!response.ok) throw new Error("删除清理未完成，请稍后重试");
-      router.push("/");
+      router.push("/notes");
     } catch (error) {
       setKnowledgeError(error instanceof Error ? error.message : "删除清理未完成，请稍后重试");
       if (hasBackend) fetchKnowledgeStatus(task.id).then(setKnowledgeStatus).catch(() => undefined);
@@ -250,35 +297,7 @@ export default function ResultPage() {
     <main className="site-shell result-page">
       <BrandHeader compact />
       <section className="result-header wrap">
-        <button className="back-link" type="button" onClick={() => router.push("/")}>← 返回处理中心</button>
-        <div className="title-actions">
-          <div>
-            <div className="result-meta">
-              <span>{visualAnalysis.content_type || "视频资产"}</span>
-              <time>{new Date(task.createdAt).toLocaleDateString("zh-CN")} 生成</time>
-              <em>已完成</em>
-            </div>
-            <h1>{task.title}</h1>
-            <p>{formatDuration(task.duration)} · {chapters.length} 个章节 · {visualAnalysis.provider || "多模态流水线"}</p>
-            {knowledgeStatus && knowledgeCopy && (
-              <div className={`knowledge-status knowledge-${knowledgeStatus.status}`} role="status">
-                <span>知识资产：<strong>{knowledgeCopy.label}</strong></span>
-                <small>{knowledgeCopy.detail}</small>
-                {!(["building", "deleting"] as string[]).includes(knowledgeStatus.status) && (
-                  <button type="button" onClick={rebuildKnowledgeAsset} disabled={knowledgeBusy}>
-                    {knowledgeStatus.status === "not_built" ? "开始构建" : "重新构建"}
-                  </button>
-                )}
-              </div>
-            )}
-            {knowledgeError && <p className="knowledge-status-error" role="alert">{knowledgeError}</p>}
-          </div>
-          <div>
-            <button className="secondary-button" type="button" onClick={regenerate}>↻ 重新生成</button>
-            <button className="dark-button" type="button" onClick={() => hasBackend ? window.location.assign(`${API_BASE}/api/snapnote/tasks/${task.id}/export/markdown`) : exportMarkdown(task)}>↓ 导出 Markdown</button>
-            {hasBackend && <button className="danger-button" type="button" onClick={deleteSourceAsset} disabled={knowledgeBusy}>删除视频</button>}
-          </div>
-        </div>
+        <button className="back-link" type="button" onClick={() => new URLSearchParams(window.location.search).get("from") === "search" ? router.back() : router.push("/notes")}>← 返回笔记管理</button>
       </section>
 
       <section className="asset-workspace wrap">
@@ -290,6 +309,7 @@ export default function ResultPage() {
                   ref={videoRef}
                   src={videoUrl}
                   controls
+                  onLoadedMetadata={(event) => applyInitialSeek(event.currentTarget)}
                   onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
                   onPlay={() => setPlaying(true)}
                   onPause={() => setPlaying(false)}
@@ -311,12 +331,39 @@ export default function ResultPage() {
                 <button type="button" aria-label="全屏">⛶</button>
               </div>
             )}
+            <div className="asset-details">
+              <h1>{task.title}</h1>
+              <div className="result-meta">
+                <span>{visualAnalysis.content_type || "视频资产"}</span>
+                <time>{new Date(task.createdAt).toLocaleDateString("zh-CN")} 生成</time>
+                <em>已完成</em>
+              </div>
+              <p className="asset-facts">{formatDuration(task.duration)} · {chapters.length} 个章节 · {visualAnalysis.provider || "多模态流水线"}</p>
+              <div className="asset-actions">
+                <button className="secondary-button" type="button" onClick={regenerate}>↻ 重新生成</button>
+                <button className="dark-button" type="button" onClick={() => hasBackend ? window.location.assign(`${API_BASE}/api/snapnote/tasks/${task.id}/export/markdown`) : exportMarkdown(task)}>↓ 导出 Markdown</button>
+                <button className="danger-button" type="button" onClick={deleteSourceAsset} disabled={knowledgeBusy}>删除视频</button>
+              </div>
+              {knowledgeStatus && knowledgeCopy && (
+                <div className={`knowledge-status knowledge-${knowledgeStatus.status}`} role="status">
+                  <span>知识资产：<strong>{knowledgeCopy.label}</strong></span>
+                  <small>{knowledgeCopy.detail}</small>
+                  {!(["building", "deleting"] as string[]).includes(knowledgeStatus.status) && (
+                    <button type="button" onClick={rebuildKnowledgeAsset} disabled={knowledgeBusy}>
+                      {knowledgeStatus.status === "not_built" ? "开始构建" : "重新构建"}
+                    </button>
+                  )}
+                </div>
+              )}
+              {knowledgeError && <p className="knowledge-status-error" role="alert">{knowledgeError}</p>}
+            </div>
             <div className="current-chapter-line" aria-live="polite">
               <span>当前章节</span>
               <strong>{currentIndex >= 0 ? chapters[currentIndex]?.title : "暂无章节"}</strong>
               <time>{currentIndex >= 0 ? formatDuration(chapters[currentIndex].time) : "--:--"}</time>
             </div>
             {seekError && <p className="asset-inline-notice" role="status">{seekError}</p>}
+            {seekNotice && !seekError && <p className="asset-inline-notice asset-seek-notice" role="status">{seekNotice}</p>}
           </div>
         </div>
 

@@ -4,7 +4,6 @@ import math
 import re
 import shutil
 import subprocess
-import urllib.request
 from pathlib import Path
 
 from sqlalchemy import delete, select
@@ -20,12 +19,18 @@ from .config import (
     FFMPEG_BIN,
     FFPROBE_BIN,
     MAX_VIDEO_DURATION_SECONDS,
+    MIMO_API_KEY,
+    MIMO_BASE_URL,
+    MIMO_VISION_MAX_ATTEMPTS,
     MIMO_VISION_MAX_CLIPS,
     MIMO_VISION_REQUIRED,
+    MIMO_VISION_MODEL,
+    MIMO_VISION_TIMEOUT_SECONDS,
     TASKS_DIR,
 )
 from .database import SnapTask, StageResult, async_session, utcnow
 from .mimo_vision import (
+    _request_json_sync,
     summarize_video_style,
     understand_clips,
     understand_keyframes,
@@ -47,7 +52,9 @@ STAGES = [
     ("detecting_frames", 38, "检测镜头", "正在扫描场景变化、运动和画面质量"),
     ("selecting_frames", 46, "选择关键帧", "正在为每个镜头选择清晰稳定的代表画面"),
     ("deduplicating_frames", 51, "关键帧去重", "正在合并重复或高度相似的画面"),
-    ("running_ocr", 56, "本地 OCR", "正在尝试提取画面中的文字"),
+    # 本地 OCR 暂停启用：设备资源有限，关键帧文字由 MiMo 视觉理解返回。
+    # 保留 running_ocr 这个阶段名，兼容已有任务状态和前端事件订阅。
+    ("running_ocr", 56, "跳过本地 OCR", "直接使用 MiMo 视觉理解关键帧及画面文字"),
     ("understanding_frames", 68, "MiMo 关键帧理解", "正在批量分析主体、场景、构图与素材风格"),
     ("understanding_clips", 76, "MiMo 动态片段理解", "正在补充动作、运镜、转场与节奏信息"),
     ("analyzing_style", 84, "整片风格与分镜分析", "正在归纳叙事结构、视觉风格和爆款元素"),
@@ -278,6 +285,12 @@ async def _extract_audio(video_path: str, audio_path: Path, duration: float):
 
 
 def _ocr_frames(frames: list[dict], frames_dir: Path):
+    """Legacy local OCR fallback; intentionally not called in the main pipeline.
+
+    MiMo now receives the original keyframe and returns ``visible_text``. Keep
+    this implementation for a future offline/high-accuracy OCR option without
+    paying the local PaddleOCR cost on the default path.
+    """
     try:
         from paddleocr import PaddleOCR
 
@@ -377,9 +390,32 @@ def _aligned_blocks(frames: list[dict], segments: list[dict], duration: float):
     return blocks
 
 
-def _llm_enhance_sync(blocks: list[dict], note_style: str):
-    if not DEEPSEEK_API_KEY:
-        return blocks
+def _llm_enhance_sync(blocks: list[dict], note_style: str, note_model: str):
+    if note_model != "deepseek":
+        api_key = MIMO_API_KEY
+        base_url = MIMO_BASE_URL
+        model = MIMO_VISION_MODEL
+        headers = {"api-key": api_key, "Content-Type": "application/json"}
+        provider = "MiMo"
+        attempts = MIMO_VISION_MAX_ATTEMPTS
+        timeout = MIMO_VISION_TIMEOUT_SECONDS
+    else:
+        api_key = DEEPSEEK_API_KEY
+        base_url = DEEPSEEK_BASE_URL
+        model = DEEPSEEK_MODEL
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        provider = "DeepSeek"
+        attempts = 2
+        timeout = 120
+    if not api_key:
+        return blocks, {
+            "enabled": False,
+            "model": model,
+            "reason": "missing_api_key",
+        }
     prompt = (
         "将以下已按镜头对齐的视频材料整理为 JSON 对象 {\"blocks\": [...]}。"
         "必须保留每项 id、frame_id、timestamp、end_time、image_url、ocr_text、confidence、"
@@ -387,28 +423,29 @@ def _llm_enhance_sync(blocks: list[dict], note_style: str):
         f"review_questions。笔记类型：{note_style}\n"
         + json.dumps(blocks, ensure_ascii=False)[:60000]
     )
-    body = json.dumps({
-        "model": DEEPSEEK_MODEL,
-        "messages": [
+    parsed, usage = _request_json_sync(
+        [
             {"role": "system", "content": "你是严谨的视频内容编辑，只输出 JSON。"},
             {"role": "user", "content": prompt},
         ],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.2,
-    }, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        f"{DEEPSEEK_BASE_URL}/chat/completions",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-            "Content-Type": "application/json",
-        },
+        "note enhancement",
+        5000,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        request_headers=headers,
+        timeout=timeout,
+        max_attempts=attempts,
     )
-    with urllib.request.urlopen(request, timeout=120) as response:
-        content = json.loads(response.read().decode("utf-8"))["choices"][0]["message"]["content"]
-    parsed = json.loads(content)
     enhanced = parsed.get("blocks", []) if isinstance(parsed, dict) else []
-    return enhanced if isinstance(enhanced, list) and enhanced else blocks
+    if not isinstance(enhanced, list) or not enhanced:
+        raise RuntimeError(f"{provider} note enhancement returned no blocks")
+    return enhanced, {
+        "enabled": True,
+        "model": model,
+        "provider": provider,
+        "usage": usage,
+    }
 
 
 def _markdown(task: SnapTask, blocks: list[dict], visual_analysis: dict):
@@ -605,36 +642,26 @@ async def _run_multimodal_branch(
     clips_dir: Path,
     segments: list[dict],
     duration: float,
+    note_style: str,
+    note_model: str,
 ):
+    # 本地 PaddleOCR 暂停执行。MiMo 直接看关键帧，并在 visual_analysis.visible_text
+    # 中返回画面文字；_ocr_frames 保留在上方，供未来离线/高精度模式恢复。
     await _set_stage(
         task_id,
         STAGES[6],
         "multimodal",
-        0,
-        "本地 OCR 与 MiMo 关键帧理解将并行执行",
+        100,
+        "已跳过本地 OCR，直接使用 MiMo 视觉理解",
+        {"enabled": False, "reason": "disabled_for_local_performance"},
     )
     await _set_stage(
         task_id,
         STAGES[7],
         "multimodal",
         0,
-        "正在并行提取画面文字并理解关键帧",
+        "正在直接使用 MiMo 理解关键帧",
     )
-
-    async def run_ocr():
-        rows = await asyncio.to_thread(
-            _ocr_frames, [dict(frame) for frame in frames], frames_dir
-        )
-        ocr_count = sum(bool(frame.get("ocr_text")) for frame in rows)
-        await _set_stage(
-            task_id,
-            STAGES[6],
-            "multimodal",
-            40,
-            "本地 OCR 阶段完成",
-            {"ocr_count": ocr_count},
-        )
-        return rows
 
     async def report_vision_progress(payload: dict):
         completed = int(payload.get("completed", 0))
@@ -669,11 +696,11 @@ async def _run_multimodal_branch(
                 "usage": {},
             }
 
-    ocr_frames, image_result = await _gather_required(
-        run_ocr(), run_image_understanding()
-    )
+    image_result = await run_image_understanding()
     image_frames, image_stats = image_result
-    frames = _merge_frame_results(frames, image_frames, ocr_frames)
+    # 第三个参数保留为空，确保合并逻辑兼容旧的 OCR 字段；ocr_text 由 MiMo
+    # 的 visible_text 回填，详见 mimo_vision.understand_keyframes。
+    frames = _merge_frame_results(frames, image_frames, [])
     await _save_frames(task_id, frames)
     await _set_stage(
         task_id,
@@ -708,20 +735,50 @@ async def _run_multimodal_branch(
         clip_stats,
     )
 
-    await _set_stage(task_id, STAGES[9], "multimodal", 70)
-    try:
-        visual_analysis, style_stats = await summarize_video_style(
-            frames, segments, duration
-        )
-    except Exception as error:
-        if MIMO_VISION_REQUIRED:
-            raise
-        visual_analysis, style_stats = await summarize_video_style([], [], duration)
-        style_stats["error"] = str(error)[:500]
+    # 逐镜头块只依赖已完成的静态/动态分析和转写，因此可以和整片风格
+    # 归纳同时执行。两个分支各自负责 fallback，避免一个模型失败拖垮另一个。
+    await _set_stage(
+        task_id,
+        STAGES[9],
+        "multimodal",
+        70,
+        "正在并行归纳整片风格与增强笔记结构",
+    )
+    base_blocks = _aligned_blocks(frames, segments, duration)
+
+    async def run_style_synthesis():
+        try:
+            return await summarize_video_style(frames, segments, duration)
+        except Exception as error:
+            if MIMO_VISION_REQUIRED:
+                raise
+            fallback = await summarize_video_style([], [], duration)
+            fallback[1]["error"] = str(error)[:500]
+            return fallback
+
+    async def run_note_enhancement():
+        try:
+            enhanced, stats = await asyncio.to_thread(
+                _llm_enhance_sync, base_blocks, note_style, note_model
+            )
+            return enhanced, stats
+        except Exception as error:
+            return base_blocks, {
+                "enabled": False,
+                "model": MIMO_VISION_MODEL if note_model != "deepseek" else DEEPSEEK_MODEL,
+                "error": str(error)[:500],
+                "fallback": "aligned_blocks",
+            }
+
+    (visual_analysis, style_stats), (note_blocks, note_stats) = await asyncio.gather(
+        run_style_synthesis(),
+        run_note_enhancement(),
+    )
     visual_analysis["pipeline_stats"] = {
         "images": image_stats,
         "clips": clip_stats,
         "synthesis": style_stats,
+        "note_enhancement": note_stats,
     }
     async with async_session() as db:
         task = await db.get(SnapTask, task_id)
@@ -736,7 +793,7 @@ async def _run_multimodal_branch(
         "整片风格、叙事和分镜画像已生成",
         {"provider": visual_analysis.get("provider"), **style_stats},
     )
-    return frames, visual_analysis, image_stats, clip_stats, style_stats
+    return frames, visual_analysis, image_stats, clip_stats, style_stats, note_blocks, note_stats
 
 
 async def _mark_pipeline_failed(task_id: str, error: Exception):
@@ -781,6 +838,8 @@ async def run_pipeline(task_id: str):
             clips_dir = task_dir / "visual_clips"
             audio_path = task_dir / "audio.wav"
             asr_provider = task.asr_provider
+            note_style = task.note_style
+            note_model = task.note_model
 
         await _set_stage(task_id, STAGES[0], "common", 20)
         metadata = await _probe(video_path)
@@ -814,22 +873,31 @@ async def run_pipeline(task_id: str):
         segments, engine = audio_result
         frames, shot_stats = vision_result
 
-        frames, visual_analysis, image_stats, clip_stats, style_stats = (
-            await _run_multimodal_branch(
-                task_id,
-                video_path,
-                frames,
-                frames_dir,
-                clips_dir,
-                segments,
-                duration,
-            )
+        (
+            frames,
+            visual_analysis,
+            image_stats,
+            clip_stats,
+            style_stats,
+            note_blocks,
+            note_stats,
+        ) = await _run_multimodal_branch(
+            task_id,
+            video_path,
+            frames,
+            frames_dir,
+            clips_dir,
+            segments,
+            duration,
+            note_style,
+            note_model,
         )
         visual_analysis["pipeline_stats"] = {
             "shots": shot_stats,
             "images": image_stats,
             "clips": clip_stats,
             "synthesis": style_stats,
+            "note_enhancement": note_stats,
         }
         async with async_session() as db:
             task = await db.get(SnapTask, task_id)
@@ -837,7 +905,7 @@ async def run_pipeline(task_id: str):
             await db.commit()
 
         await _set_stage(task_id, STAGES[10], "output", 0)
-        blocks = _aligned_blocks(frames, segments, duration)
+        blocks = note_blocks
         await _set_stage(
             task_id,
             STAGES[10],
@@ -848,14 +916,6 @@ async def run_pipeline(task_id: str):
         )
 
         await _set_stage(task_id, STAGES[11], "output", 25)
-        try:
-            async with async_session() as db:
-                task = await db.get(SnapTask, task_id)
-                blocks = await asyncio.to_thread(
-                    _llm_enhance_sync, blocks, task.note_style
-                )
-        except Exception:
-            pass
         await _set_stage(
             task_id,
             STAGES[11],

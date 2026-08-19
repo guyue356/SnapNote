@@ -21,11 +21,13 @@ export type SnapTask = {
   stageIndex: number;
   asrProvider: "mimo" | "whisper";
   noteStyle: "classroom" | "meeting";
+  noteModel: "mimo" | "deepseek";
   frameCount: number;
   createdAt: string;
   completedAt?: string;
   errorMessage?: string;
   processingState?: Record<string, ProcessingBranchState>;
+  thumbnailUrl?: string;
 };
 
 export const STAGES = [
@@ -101,8 +103,8 @@ let cachedSeededTasks: SnapTask[] | undefined;
 function seededTasks(): SnapTask[] {
   const now = Date.now();
   return [
-    { id: "demo-transformer", title: "Transformer 核心原理与注意力机制", filename: "week-04-transformer.mp4", fileSize: 486000000, duration: 447, status: "completed", progress: 100, stageIndex: STAGES.length - 1, asrProvider: "mimo", noteStyle: "classroom", frameCount: 12, createdAt: new Date(now - 86400000).toISOString(), completedAt: new Date(now - 85800000).toISOString() },
-    { id: "demo-product", title: "产品增长实验复盘会", filename: "growth-review.mov", fileSize: 238000000, duration: 2154, status: "completed", progress: 100, stageIndex: STAGES.length - 1, asrProvider: "whisper", noteStyle: "meeting", frameCount: 18, createdAt: new Date(now - 172800000).toISOString(), completedAt: new Date(now - 171600000).toISOString() },
+    { id: "demo-transformer", title: "Transformer 核心原理与注意力机制", filename: "week-04-transformer.mp4", fileSize: 486000000, duration: 447, status: "completed", progress: 100, stageIndex: STAGES.length - 1, asrProvider: "mimo", noteStyle: "classroom", noteModel: "mimo", frameCount: 12, createdAt: new Date(now - 86400000).toISOString(), completedAt: new Date(now - 85800000).toISOString() },
+    { id: "demo-product", title: "产品增长实验复盘会", filename: "growth-review.mov", fileSize: 238000000, duration: 2154, status: "completed", progress: 100, stageIndex: STAGES.length - 1, asrProvider: "whisper", noteStyle: "meeting", noteModel: "deepseek", frameCount: 18, createdAt: new Date(now - 172800000).toISOString(), completedAt: new Date(now - 171600000).toISOString() },
   ];
 }
 
@@ -173,10 +175,39 @@ export function saveTask(task: SnapTask) {
   window.dispatchEvent(new Event(TASKS_CHANGE_EVENT));
 }
 
-export function createLocalTask(file: File, asrProvider: SnapTask["asrProvider"], noteStyle: SnapTask["noteStyle"]): SnapTask {
+export function deleteLocalTask(id: string) {
+  const tasks = getTasks().filter((task) => task.id !== id);
+  const raw = JSON.stringify(tasks);
+  localStorage.setItem(STORAGE_KEY, raw);
+  cachedTasksRaw = raw;
+  cachedTasks = tasks;
+  const target = window as typeof window & { [VIDEO_KEY]?: Record<string, string> };
+  if (target[VIDEO_KEY]?.[id]) {
+    URL.revokeObjectURL(target[VIDEO_KEY]![id]);
+    delete target[VIDEO_KEY]![id];
+  }
+  window.dispatchEvent(new Event(TASKS_CHANGE_EVENT));
+}
+
+export function retryLocalTask(task: SnapTask): SnapTask {
+  const next: SnapTask = {
+    ...task,
+    status: "processing",
+    progress: 4,
+    stageIndex: 0,
+    frameCount: 0,
+    completedAt: undefined,
+    errorMessage: undefined,
+    processingState: undefined,
+  };
+  saveTask(next);
+  return next;
+}
+
+export function createLocalTask(file: File, asrProvider: SnapTask["asrProvider"], noteStyle: SnapTask["noteStyle"], noteModel: SnapTask["noteModel"]): SnapTask {
   const id = typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `task-${Date.now()}`;
   const title = file.name.replace(/\.[^.]+$/, "").replace(/[-_]+/g, " ");
-  const task: SnapTask = { id, title, filename: file.name, fileSize: file.size, duration: 447, status: "processing", progress: 4, stageIndex: 0, asrProvider, noteStyle, frameCount: 0, createdAt: new Date().toISOString() };
+  const task: SnapTask = { id, title, filename: file.name, fileSize: file.size, duration: 447, status: "processing", progress: 4, stageIndex: 0, asrProvider, noteStyle, noteModel, frameCount: 0, createdAt: new Date().toISOString() };
   saveTask(task);
   return task;
 }

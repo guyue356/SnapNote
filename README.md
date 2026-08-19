@@ -12,7 +12,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=111)](https://react.dev/)
 
-[本地启动](#方式二windows-一键启动) · [知识资产化 PRD](./PRD/PRD-DEV-001-SnapNote-知识资产化一期.md) · [产品规划](./PRD/PRD-ROADMAP-001-SnapNote-未来产品规划.md) · [API 文档](#api-接口)
+[本地启动](#方式二windows-统一控制台) · [知识资产化 PRD](./PRD/PRD-DEV-001-SnapNote-知识资产化一期.md) · [产品规划](./PRD/PRD-ROADMAP-001-SnapNote-未来产品规划.md) · [API 文档](#api-接口)
 
 </div>
 
@@ -70,7 +70,7 @@ ASR 可在本机 Whisper 与 MIMO-ASR 间选择；视觉统一使用 `mimo-v2.5`
 
 ### 本地 Demo
 
-双击 `start-snapnote.cmd`，然后访问 **http://127.0.0.1:43871**：
+双击 `snapnote.cmd` 并选择“启动”，然后访问 **http://127.0.0.1:43871**：
 
 1. 拖入 MP4、MOV 或 WebM 视频；
 2. 选择识别方案与笔记类型；
@@ -124,22 +124,22 @@ ASR 可在本机 Whisper 与 MIMO-ASR 间选择；视觉统一使用 `mimo-v2.5`
 请帮我在 Windows 上安装并启动 SnapNote：
 1. 克隆仓库：https://github.com/guyue356/SnapNote.git
 2. 检查 Conda、Node.js 22.13+ 和 ffmpeg
-3. 在仓库根目录运行 .\start.ps1
+3. 在仓库根目录运行 .\snapnote.cmd start
 4. 如果需要真实 ASR，请按 README 配置 backend/.env
 5. 验证 http://127.0.0.1:43871 和 http://127.0.0.1:43872/api/health
 请保留现有配置，不要提交任何 API Key。
 ```
 
-### 方式二：Windows 一键启动
+### 方式二：Windows 统一控制台
 
-克隆项目后，可以直接双击根目录的 `start-snapnote.cmd`。脚本会在后台启动前后端，确认服务正常后自动打开浏览器。需要关闭时双击 `stop-snapnote.cmd`。
+克隆项目后，直接双击根目录的 `snapnote.cmd`，即可通过菜单启动、关闭、重启、查看状态或查看日志。脚本会在后台启动前后端，确认服务正常后自动打开浏览器。
 
 也可以在 PowerShell 中运行：
 
 ```powershell
 git clone https://github.com/guyue356/SnapNote.git
 cd SnapNote
-.\start.ps1
+.\snapnote.cmd start
 ```
 
 脚本会自动：
@@ -151,16 +151,20 @@ cd SnapNote
 - 在 `http://127.0.0.1:43872` 启动 API；
 - 将运行日志保存到 `.snapnote-logs`，并记录进程以便安全关闭。
 
-关闭服务：
+常用管理命令：
 
 ```powershell
-.\stop.ps1
+.\snapnote.cmd start
+.\snapnote.cmd stop
+.\snapnote.cmd restart
+.\snapnote.cmd status
+.\snapnote.cmd logs
 ```
 
 依赖已经安装时，可以减少检查步骤：
 
 ```powershell
-.\start.ps1 -SkipInstall
+.\snapnote.cmd start -SkipInstall
 ```
 
 ### 方式三：手动安装
@@ -613,10 +617,8 @@ SnapNote/
 │   │                             # 产品阶段规划
 │   └── SnapNote_*.md             # 基础产品、Web Demo 与资产页 PRD
 ├── storage/                     # SQLite 与任务文件，运行时生成且不提交
-├── start-snapnote.cmd           # Windows 双击启动
-├── stop-snapnote.cmd            # Windows 双击关闭
-├── start.ps1                    # 一键启动核心脚本
-├── stop.ps1                     # 按记录安全关闭前后端
+├── snapnote.cmd                 # Windows 统一入口与交互菜单
+├── snapnote.ps1                 # 启停、重启、状态和日志控制器
 └── README.md
 ```
 
@@ -660,6 +662,7 @@ SnapNote/
 | `ENABLE_MIMO_VISION` | 否 | `1` | 启用 MiMo v2.5 关键帧、动态片段和整片分析 |
 | `MIMO_VISION_REQUIRED` | 否 | `0` | 视觉 API 失败时是否让任务严格失败 |
 | `MIMO_VISION_MODEL` | 否 | `mimo-v2.5` | 图片与视频理解模型名 |
+| `DEFAULT_NOTE_MODEL` | 否 | `mimo` | 笔记增强模型默认选项：`mimo` 或 `deepseek` |
 | `MIMO_VISION_IMAGE_BATCH_SIZE` | 否 | `8` | 每次多图请求的关键帧数量 |
 | `MIMO_VISION_CONCURRENCY` | 否 | `2` | 多图批次最大并发数 |
 | `MIMO_VISION_TIMEOUT_SECONDS` | 否 | `180` | 单次视觉请求超时 |

@@ -39,6 +39,7 @@ class SnapTask(Base):
     progress: Mapped[int] = mapped_column(Integer, default=0)
     asr_provider: Mapped[str] = mapped_column(String(20), default="whisper")
     note_style: Mapped[str] = mapped_column(String(20), default="classroom")
+    note_model: Mapped[str] = mapped_column(String(20), default="mimo")
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     frames_json: Mapped[str] = mapped_column(Text, default="[]")
     transcripts_json: Mapped[str] = mapped_column(Text, default="[]")
@@ -254,6 +255,11 @@ async def init_db():
                     await connection.execute(text(
                         "ALTER TABLE snap_tasks ADD COLUMN processing_state_json "
                         "TEXT NOT NULL DEFAULT '{}'"
+                    ))
+                if "note_model" not in existing:
+                    await connection.execute(text(
+                        "ALTER TABLE snap_tasks ADD COLUMN note_model "
+                        "VARCHAR(20) NOT NULL DEFAULT 'mimo'"
                     ))
         await connection.run_sync(Base.metadata.create_all)
         applied = (await connection.execute(text(

@@ -972,7 +972,8 @@ SnapNote/
 │   ├── frames/
 │   ├── output/
 │   └── app.db
-├── start.ps1
+├── snapnote.cmd
+├── snapnote.ps1
 └── README.md
 ```
 
@@ -1292,4 +1293,3 @@ Web Demo 应坚持以下原则：
 首个可交付版本的定义：
 
 > 上传一个 PPT 型课堂视频后，用户能够获得一份按关键画面组织的图文笔记，并可从任意笔记块跳回视频对应时间。
-

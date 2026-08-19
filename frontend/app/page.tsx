@@ -3,14 +3,16 @@
 import { ChangeEvent, DragEvent, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import BrandHeader from "./components/BrandHeader";
-import { createBackendTask, fetchBackendTasks, hasBackend, toLocalTask } from "./lib/api";
+import { createBackendTask, deleteBackendTask, fetchBackendTasks, hasBackend, retryBackendTask, toLocalTask } from "./lib/api";
 import {
   createLocalTask,
+  deleteLocalTask,
   formatBytes,
   formatDuration,
   getLocalTasksServerSnapshot,
   getLocalTasksSnapshot,
   saveVideoUrl,
+  retryLocalTask,
   subscribeLocalTasks,
   type SnapTask,
 } from "./lib/demo";
@@ -24,13 +26,19 @@ export default function Home() {
   const [previewUrl, setPreviewUrl] = useState("");
   const [asr, setAsr] = useState<"mimo" | "whisper">("whisper");
   const [style, setStyle] = useState<"classroom" | "meeting">("classroom");
+  const [noteModel, setNoteModel] = useState<"mimo" | "deepseek">("mimo");
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState("");
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [taskActionBusy, setTaskActionBusy] = useState("");
+  const [taskActionError, setTaskActionError] = useState("");
   const localTasks = useSyncExternalStore(subscribeLocalTasks, getLocalTasksSnapshot, getLocalTasksServerSnapshot);
   const [remoteTasks, setRemoteTasks] = useState<SnapTask[]>([]);
   const tasks = hasBackend ? remoteTasks : localTasks;
+  const recentTasks = [...tasks]
+    .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime())
+    .slice(0, 3);
 
   useEffect(() => {
     if (!hasBackend) return;
@@ -74,7 +82,7 @@ export default function Home() {
 
     if (hasBackend) {
       try {
-        const created = await createBackendTask(file, asr, style, setUploadProgress);
+        const created = await createBackendTask(file, asr, style, noteModel, setUploadProgress);
         setUploadProgress(100);
         router.push(`/tasks/${created.task_id}/processing`);
       } catch (problem) {
@@ -84,7 +92,7 @@ export default function Home() {
       return;
     }
 
-    const task = createLocalTask(file, asr, style);
+    const task = createLocalTask(file, asr, style, noteModel);
     saveVideoUrl(task.id, previewUrl);
 
     const timer = window.setInterval(() => {
@@ -97,16 +105,50 @@ export default function Home() {
     router.push(`/tasks/${task.id}/processing`);
   }
 
+  async function retryFailedTask(task: SnapTask) {
+    if (taskActionBusy) return;
+    setTaskActionBusy(task.id);
+    setTaskActionError("");
+    try {
+      if (hasBackend) await retryBackendTask(task.id, task.asrProvider);
+      else retryLocalTask(task);
+      router.push(`/tasks/${task.id}/processing`);
+    } catch (problem) {
+      setTaskActionError(problem instanceof Error ? problem.message : "暂时无法重新生成，请稍后重试。");
+      setTaskActionBusy("");
+    }
+  }
+
+  async function deleteFailedTask(task: SnapTask) {
+    if (taskActionBusy || !window.confirm(
+      `确认删除失败任务“${task.title}”？\n\n原视频、处理结果和关联知识数据都会被清理，且无法恢复。`
+    )) return;
+    setTaskActionBusy(task.id);
+    setTaskActionError("");
+    try {
+      if (hasBackend) {
+        await deleteBackendTask(task.id);
+        setRemoteTasks((items) => items.filter((item) => item.id !== task.id));
+      } else {
+        deleteLocalTask(task.id);
+      }
+    } catch (problem) {
+      setTaskActionError(problem instanceof Error ? problem.message : "删除清理未完成，请稍后重试。");
+    } finally {
+      setTaskActionBusy("");
+    }
+  }
+
   return (
     <main className="site-shell">
       <BrandHeader />
 
       <section className="hero wrap">
         <div className="hero-copy">
-          <div className="eyebrow"><span className="spark">✦</span> AI 视觉笔记工作台</div>
-          <h1>把一小时视频，<br /><span>变成能检索、能复刻</span><br />的多模态素材</h1>
+          <div className="eyebrow"><span className="spark">✦</span> AI 多模态笔记</div>
+          <h1>SnapNote<br /><span>把知识视频，变成可检索的多模态笔记</span></h1>
           <p className="hero-lead">
-            本机精确转写与智能抽帧控制成本，MiMo 理解镜头、风格、节奏和分镜。每条结果都能跳回视频原位置。
+            自动提取关键画面、转写语音内容，并与时间轴精准对齐，每条笔记都能定位关键画面，处理 30 分钟视频，模型成本仅需约 0.5 元。
           </p>
           <div className="value-row">
             <div><b>01</b><span>关键画面<br />自动捕捉</span></div>
@@ -177,6 +219,17 @@ export default function Home() {
               </label>
             </fieldset>
             <fieldset>
+              <legend>笔记增强模型</legend>
+              <label className={noteModel === "mimo" ? "selected" : ""}>
+                <input type="radio" name="note-model" checked={noteModel === "mimo"} onChange={() => setNoteModel("mimo")} />
+                <span><b>MiMo v2.5</b><small>视觉理解与笔记统一</small></span><em>推荐</em>
+              </label>
+              <label className={noteModel === "deepseek" ? "selected" : ""}>
+                <input type="radio" name="note-model" checked={noteModel === "deepseek"} onChange={() => setNoteModel("deepseek")} />
+                <span><b>DeepSeek Chat</b><small>文本整理与表达增强</small></span>
+              </label>
+            </fieldset>
+            <fieldset>
               <legend>笔记类型</legend>
               <div className="toggle-group">
                 <button type="button" className={style === "classroom" ? "active" : ""} onClick={() => setStyle("classroom")}><b>课堂笔记</b><small>知识点与复习题</small></button>
@@ -202,21 +255,31 @@ export default function Home() {
       <section className="recent-section wrap" id="recent">
         <div className="section-title">
           <div><span className="step-kicker">YOUR LIBRARY</span><h2>最近任务</h2></div>
-          <span>{tasks.length} 个视频</span>
+          <button type="button" className="section-link" onClick={() => router.push("/notes")}>查看全部 {tasks.length} 个视频 →</button>
         </div>
         <div className="task-table">
           <div className="task-row task-head"><span>视频</span><span>创建时间</span><span>时长</span><span>关键帧</span><span>状态</span><span /></div>
-          {tasks.map((task) => (
+          {recentTasks.map((task) => (
             <div className="task-row" key={task.id}>
               <div className="task-name"><i>{task.noteStyle === "classroom" ? "课" : "会"}</i><span><b>{task.title}</b><small>{task.filename}</small></span></div>
               <span>{new Date(task.createdAt).toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" })}</span>
               <span>{formatDuration(task.duration)}</span>
               <span>{task.frameCount || "—"}</span>
               <span><em className={`status ${task.status}`}>{task.status === "completed" ? "已完成" : task.status === "failed" ? "失败" : "处理中"}</em></span>
-              <button type="button" className="row-action" onClick={() => router.push(task.status === "completed" ? `/tasks/${task.id}` : `/tasks/${task.id}/processing`)} aria-label={`查看 ${task.title}`}>↗</button>
+              <div className="task-row-actions">
+                {task.status === "failed" && (
+                  <>
+                    <button type="button" className="row-action retry icon-tooltip" data-tooltip="重新生成" onClick={() => retryFailedTask(task)} disabled={taskActionBusy === task.id} aria-label={`重新生成 ${task.title}`}>↻</button>
+                    <button type="button" className="row-action delete icon-tooltip" data-tooltip="删除任务" onClick={() => deleteFailedTask(task)} disabled={taskActionBusy === task.id} aria-label={`删除 ${task.title}`}>×</button>
+                  </>
+                )}
+                <button type="button" className="row-action icon-tooltip" data-tooltip="查看详情" onClick={() => router.push(task.status === "completed" ? `/tasks/${task.id}` : `/tasks/${task.id}/processing`)} aria-label={`查看 ${task.title}`}>↗</button>
+              </div>
             </div>
           ))}
+          {!recentTasks.length && <div className="task-empty">还没有任务，上传第一个视频开始生成笔记吧。</div>}
         </div>
+        {taskActionError && <p className="recent-action-error" role="alert">{taskActionError}</p>}
       </section>
 
       <footer className="footer wrap"><span>SnapNote <b>✦</b></span><p>让视频不再只是看过，而是留下真正可复习的知识。</p><small>Web Demo · 2026</small></footer>

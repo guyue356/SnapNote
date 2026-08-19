@@ -428,7 +428,10 @@ async def transcribe_with_mimo(
         await _emit(
             progress_callback,
             progress_pct=10,
-            detail=f"Prepared {total_chunks} chunks (concurrency {concurrency})",
+            detail=(
+                f"已完成 0 / {total_chunks} 个音频分片"
+                f"（并发数 {concurrency}）"
+            ),
             api_requests_completed=0,
             api_requests_total=total_chunks,
         )
@@ -439,11 +442,10 @@ async def transcribe_with_mimo(
             nonlocal completed_chunks
             async with semaphore:
                 progress = 10 + int(completed_chunks / total_chunks * 85)
-                mode = "fallback " if fallback else ""
                 await _emit(
                     progress_callback,
                     progress_pct=progress,
-                    detail=f"Calling MIMO-ASR {mode}chunk {index}/{total_chunks}",
+                    detail=f"已完成 {completed_chunks} / {total_chunks} 个音频分片",
                     api_requests_completed=completed_chunks,
                     api_requests_total=total_chunks,
                     api_request_current=index,
@@ -462,8 +464,8 @@ async def transcribe_with_mimo(
                         progress_callback,
                         progress_pct=progress,
                         detail=(
-                            f"Waiting for MIMO-ASR {mode}chunk "
-                            f"{index}/{total_chunks} ({elapsed}s)"
+                            f"已完成 {completed_chunks} / {total_chunks} 个音频分片"
+                            f"（转录处理中，已等待 {elapsed} 秒）"
                         ),
                         api_requests_completed=completed_chunks,
                         api_requests_total=total_chunks,
@@ -485,7 +487,7 @@ async def transcribe_with_mimo(
                 await _emit(
                     progress_callback,
                     progress_pct=min(95, 10 + int(completed_chunks / total_chunks * 85)),
-                    detail=f"Finished MIMO-ASR chunk {index}/{total_chunks}",
+                    detail=f"已完成 {completed_chunks} / {total_chunks} 个音频分片",
                     api_requests_completed=completed_chunks,
                     api_requests_total=total_chunks,
                     api_request_current=index,
@@ -536,7 +538,7 @@ async def transcribe_with_mimo(
         await _emit(
             progress_callback,
             progress_pct=100,
-            detail=f"{len(final_segments)} MIMO-ASR chunks",
+            detail=f"已完成 {len(final_segments)} / {total_chunks} 个音频分片",
             api_requests_completed=len(final_segments),
             api_requests_total=total_chunks,
             language=language,

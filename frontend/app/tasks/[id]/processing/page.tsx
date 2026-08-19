@@ -3,8 +3,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import BrandHeader from "../../../components/BrandHeader";
-import { formatDuration, getTask, saveTask, STAGES, type ProcessingBranchState, type SnapTask } from "../../../lib/demo";
-import { API_BASE, fetchBackendTask, hasBackend, toLocalTask } from "../../../lib/api";
+import { deleteLocalTask, formatDuration, getTask, retryLocalTask, saveTask, STAGES, type ProcessingBranchState, type SnapTask } from "../../../lib/demo";
+import { API_BASE, deleteBackendTask, fetchBackendTask, hasBackend, retryBackendTask, toLocalTask } from "../../../lib/api";
 
 const BRANCH_ORDER = ["common", "audio", "vision", "multimodal", "output"] as const;
 const BRANCH_ICONS: Record<(typeof BRANCH_ORDER)[number], string> = {
@@ -55,6 +55,8 @@ export default function ProcessingPage() {
   const [task, setTask] = useState<SnapTask | undefined>(() => typeof window === "undefined" || hasBackend ? undefined : getTask(params.id));
   const [elapsed, setElapsed] = useState(0);
   const [ready, setReady] = useState(() => typeof window !== "undefined" && !hasBackend && getTask(params.id)?.status === "completed");
+  const [actionBusy, setActionBusy] = useState<"retry" | "delete" | "">("");
+  const [actionError, setActionError] = useState("");
   const localTaskRef = useRef(task);
 
   useEffect(() => {
@@ -136,6 +138,42 @@ export default function ProcessingPage() {
     [branches],
   );
 
+  async function retryTask() {
+    if (!task || actionBusy) return;
+    setActionBusy("retry");
+    setActionError("");
+    try {
+      if (hasBackend) {
+        await retryBackendTask(task.id, task.asrProvider);
+        setTask({ ...task, status: "processing", progress: 4, stageIndex: 0, errorMessage: undefined, processingState: undefined });
+      } else {
+        setTask(retryLocalTask(task));
+      }
+      setReady(false);
+      setElapsed(0);
+    } catch (problem) {
+      setActionError(problem instanceof Error ? problem.message : "暂时无法重新生成，请稍后重试。");
+    } finally {
+      setActionBusy("");
+    }
+  }
+
+  async function deleteTask() {
+    if (!task || actionBusy || !window.confirm(
+      `确认删除失败任务“${task.title}”？\n\n原视频、处理结果和关联知识数据都会被清理，且无法恢复。`
+    )) return;
+    setActionBusy("delete");
+    setActionError("");
+    try {
+      if (hasBackend) await deleteBackendTask(task.id);
+      else deleteLocalTask(task.id);
+      router.push("/notes");
+    } catch (problem) {
+      setActionError(problem instanceof Error ? problem.message : "删除清理未完成，请稍后重试。");
+      setActionBusy("");
+    }
+  }
+
   if (!task) return <div className="loading-screen">正在读取任务…</div>;
   const failed = task.status === "failed";
   const currentTitle = failed
@@ -161,6 +199,14 @@ export default function ProcessingPage() {
             <span className="step-kicker">AI PROCESSING</span>
             <h1>{ready ? "图文笔记已生成" : failed ? "这次处理没有完成" : "正在读懂你的视频"}</h1>
             <p>{ready ? "正在为你打开结果页…" : failed ? "你可以返回任务页调整识别引擎后重试。" : "音频与画面会并行处理；每条分支的状态和进度都会自动保存。"}</p>
+            {failed && (
+              <div className="failure-actions">
+                <button className="retry-button" type="button" onClick={retryTask} disabled={Boolean(actionBusy)}>{actionBusy === "retry" ? "正在重新生成…" : "↻ 重新生成"}</button>
+                <button className="danger-button" type="button" onClick={deleteTask} disabled={Boolean(actionBusy)}>{actionBusy === "delete" ? "正在删除…" : "删除任务"}</button>
+                <button className="secondary-button" type="button" onClick={() => router.push("/notes")} disabled={Boolean(actionBusy)}>返回笔记管理</button>
+              </div>
+            )}
+            {actionError && <p className="failure-action-error" role="alert">{actionError}</p>}
           </div>
           <div className="progress-orbit" style={{ "--progress": `${task.progress * 3.6}deg` } as React.CSSProperties}>
             <div><b>{Math.round(task.progress)}</b><span>%</span><small>总体进度</small></div>

@@ -43,6 +43,43 @@ export type KnowledgeAssetStatus = {
   updated_at?: string;
 };
 
+export type KnowledgeContentType = "video_summary" | "chapter_summary" | "transcript" | "note";
+
+export type KnowledgeSearchHit = {
+  chunk_id: string;
+  asset_id: string;
+  task_id: string;
+  asset_version_id: string;
+  asset_title: string;
+  content_type: KnowledgeContentType;
+  chapter_id: string | null;
+  chapter_title: string | null;
+  text: string;
+  start_time: number | null;
+  end_time: number | null;
+  keyframe: {
+    id: string;
+    frame_id: string;
+    media_type: string;
+    relative_uri: string;
+    timestamp: number;
+    availability: string;
+  } | null;
+  score: number;
+  matched_field: "asset_title" | "chapter_title" | "content_title" | "text";
+  source_status: "ready" | "degraded";
+};
+
+export type KnowledgeSearchResponse = {
+  query: string;
+  scope: { asset_ids: string[] | null; owner_scope: string };
+  results: KnowledgeSearchHit[];
+  total: number;
+  available_assets: number;
+  degraded_search: boolean;
+  elapsed_ms: number;
+};
+
 export type BackendTask = {
   id: string;
   filename: string;
@@ -53,6 +90,7 @@ export type BackendTask = {
   progress: number;
   asr_provider: "mimo" | "whisper";
   note_style: "classroom" | "meeting";
+  note_model: "mimo" | "deepseek";
   error_message?: string;
   frame_count: number;
   frames: Array<{ timestamp: number; image_url: string }>;
@@ -85,19 +123,22 @@ export function toLocalTask(task: BackendTask): SnapTask {
     stageIndex: remoteStage >= 0 ? remoteStage : Math.min(stageOrder.length - 1, Math.floor(task.progress / (100 / stageOrder.length))),
     asrProvider: task.asr_provider,
     noteStyle: task.note_style,
+    noteModel: task.note_model || "mimo",
     frameCount: task.frame_count,
     createdAt: task.created_at,
     errorMessage: task.error_message,
     processingState: task.processing_state,
+    thumbnailUrl: backendAsset(task.frames[0]?.image_url || ""),
   };
 }
 
-export function createBackendTask(file: File, asr: string, style: string, onProgress: (value: number) => void): Promise<{ task_id: string }> {
+export function createBackendTask(file: File, asr: string, style: string, noteModel: string, onProgress: (value: number) => void): Promise<{ task_id: string }> {
   return new Promise((resolve, reject) => {
     const data = new FormData();
     data.append("video", file);
     data.append("asr_provider", asr);
     data.append("note_style", style);
+    data.append("note_model", noteModel);
     const request = new XMLHttpRequest();
     request.open("POST", `${API_BASE}/api/snapnote/tasks`);
     request.upload.onprogress = (event) => event.lengthComputable && onProgress(Math.round(event.loaded / event.total * 100));
@@ -120,6 +161,57 @@ export async function fetchBackendTasks(): Promise<BackendTask[]> {
   const response = await fetch(`${API_BASE}/api/snapnote/tasks`, { cache: "no-store" });
   if (!response.ok) throw new Error("无法读取任务列表");
   return response.json();
+}
+
+export async function searchKnowledge(
+  query: string,
+  contentTypes?: KnowledgeContentType[],
+  signal?: AbortSignal,
+): Promise<KnowledgeSearchResponse> {
+  const response = await fetch(`${API_BASE}/api/knowledge/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query,
+      ...(contentTypes?.length ? { content_types: contentTypes } : {}),
+      top_k: 12,
+      owner_scope: "local",
+    }),
+    signal,
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    const detail = payload.detail;
+    const message = typeof detail === "string"
+      ? detail
+      : typeof detail?.summary === "string"
+        ? detail.summary
+        : response.status === 503
+          ? "检索功能当前未启用"
+          : "知识检索暂时不可用，请稍后重试";
+    throw new Error(message);
+  }
+  return response.json();
+}
+
+export async function retryBackendTask(id: string, asrProvider?: "mimo" | "whisper"): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/snapnote/tasks/${id}/retry`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(asrProvider ? { asr_provider: asrProvider } : {}),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(typeof payload.detail === "string" ? payload.detail : "暂时无法重新生成，请稍后重试");
+  }
+}
+
+export async function deleteBackendTask(id: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/snapnote/tasks/${id}`, { method: "DELETE" });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(typeof payload.detail === "string" ? payload.detail : "删除清理未完成，请稍后重试");
+  }
 }
 
 export async function fetchKnowledgeStatus(id: string): Promise<KnowledgeAssetStatus> {
