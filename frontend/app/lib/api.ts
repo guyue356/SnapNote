@@ -66,7 +66,7 @@ export type KnowledgeSearchHit = {
     availability: string;
   } | null;
   score: number;
-  matched_field: "asset_title" | "chapter_title" | "content_title" | "text";
+  matched_field: "asset_title" | "chapter_title" | "content_title" | "text" | "semantic";
   source_status: "ready" | "degraded";
 };
 
@@ -77,6 +77,7 @@ export type KnowledgeSearchResponse = {
   total: number;
   available_assets: number;
   degraded_search: boolean;
+  retrieval_mode: "hybrid" | "keyword";
   elapsed_ms: number;
 };
 

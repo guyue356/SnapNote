@@ -22,13 +22,24 @@ from urllib.parse import unquote
 
 from sqlalchemy import and_, delete, func, or_, select
 
-from .config import KNOWLEDGE_OWNER_SCOPE, TASKS_DIR
+from .config import (
+    DATABASE_URL,
+    EMBEDDING_MODEL_NAME,
+    EMBEDDING_MODEL_VERSION,
+    EMBEDDING_DIMENSIONS,
+    ENABLE_KNOWLEDGE_EMBEDDINGS,
+    ENABLE_KNOWLEDGE_SEMANTIC_SEARCH,
+    KNOWLEDGE_OWNER_SCOPE,
+    SEMANTIC_RECALL_K,
+    TASKS_DIR,
+)
 from .database import (
     KnowledgeAsset,
     KnowledgeAssetVersion,
     KnowledgeBuildRun,
     KnowledgeChapter,
     KnowledgeChunk,
+    KnowledgeEmbedding,
     KnowledgeMedia,
     KnowledgeTranscriptSegment,
     SnapTask,
@@ -52,6 +63,83 @@ class KnowledgeError(ValueError):
         super().__init__(summary)
         self.code = code
         self.summary = summary[:500]
+
+
+async def rebuild_knowledge_embeddings(
+    *, asset_id: str | None = None,
+    asset_version_id: str | None = None,
+    owner_scope: str = KNOWLEDGE_OWNER_SCOPE,
+) -> dict:
+    """Generate a rebuildable embedding index for current knowledge chunks."""
+    from .embedding import embed_texts
+
+    async with async_session() as db:
+        filters = [
+            KnowledgeAsset.owner_scope == owner_scope,
+            KnowledgeAsset.status.in_(SEARCHABLE_STATUSES),
+            KnowledgeAsset.current_version_id == KnowledgeAssetVersion.id,
+            KnowledgeChunk.asset_version_id == KnowledgeAssetVersion.id,
+        ]
+        if asset_id:
+            filters.append(KnowledgeAsset.id == asset_id)
+        if asset_version_id:
+            filters.append(KnowledgeAssetVersion.id == asset_version_id)
+        rows = (await db.execute(select(
+            KnowledgeChunk, KnowledgeAssetVersion, KnowledgeAsset
+        ).join(
+            KnowledgeAssetVersion, KnowledgeAssetVersion.id == KnowledgeChunk.asset_version_id
+        ).join(
+            KnowledgeAsset, KnowledgeAsset.id == KnowledgeAssetVersion.asset_id
+        ).where(*filters).order_by(KnowledgeChunk.id))).all()
+
+    if not rows:
+        return {"status": "empty", "model": EMBEDDING_MODEL_NAME, "indexed": 0}
+
+    texts = [
+        _normalized_text(
+            f"类型：{chunk.content_type}\n标题：{chunk.title}\n内容：{chunk.text}"
+        )
+        for chunk, _, _ in rows
+    ]
+    vectors = await embed_texts(texts)
+    if len(vectors) != len(rows):
+        raise KnowledgeError("EMBEDDING_COUNT_MISMATCH", "Embedding 返回数量与知识分块不一致")
+    if any(len(vector) != EMBEDDING_DIMENSIONS for vector in vectors):
+        raise KnowledgeError(
+            "EMBEDDING_DIMENSION_MISMATCH",
+            f"Embedding 维度必须为 {EMBEDDING_DIMENSIONS}",
+        )
+
+    async with async_session() as db:
+        chunk_ids = [chunk.id for chunk, _, _ in rows]
+        await db.execute(delete(KnowledgeEmbedding).where(
+            KnowledgeEmbedding.chunk_id.in_(chunk_ids),
+            KnowledgeEmbedding.model_name == EMBEDDING_MODEL_NAME,
+            KnowledgeEmbedding.model_version == EMBEDDING_MODEL_VERSION,
+        ))
+        for (chunk, version, _), vector in zip(rows, vectors):
+            db.add(KnowledgeEmbedding(
+                id=_stable_id(
+                    "embedding",
+                    f"{chunk.id}:{EMBEDDING_MODEL_NAME}:{EMBEDDING_MODEL_VERSION}",
+                ),
+                chunk_id=chunk.id,
+                asset_version_id=version.id,
+                model_name=EMBEDDING_MODEL_NAME,
+                model_version=EMBEDDING_MODEL_VERSION,
+                dimensions=EMBEDDING_DIMENSIONS,
+                content_hash=chunk.content_hash,
+                embedding=vector,
+            ))
+        await db.commit()
+    logger.info("knowledge_embeddings_rebuilt", extra={
+        "asset_id": asset_id, "asset_version_id": asset_version_id,
+        "model": EMBEDDING_MODEL_NAME, "indexed": len(rows),
+    })
+    return {
+        "status": "ready", "model": EMBEDDING_MODEL_NAME,
+        "model_version": EMBEDDING_MODEL_VERSION, "indexed": len(rows),
+    }
 
 
 def _stable_id(kind: str, key: str) -> str:
@@ -594,10 +682,25 @@ async def build_knowledge_asset(
                 "chunk_count": len(prepared["chunks"]),
                 "media_count": len(prepared["media"]),
             })
+            embedding_status = "disabled"
+            if ENABLE_KNOWLEDGE_EMBEDDINGS:
+                try:
+                    embedding_result = await rebuild_knowledge_embeddings(
+                        asset_version_id=version_id
+                    )
+                    embedding_status = embedding_result["status"]
+                except Exception as error:
+                    # A semantic index is derived data; a model/runtime failure
+                    # must not turn a valid knowledge asset into a failed asset.
+                    embedding_status = "unavailable"
+                    logger.warning(
+                        "knowledge_embedding_build_failed",
+                        extra={"task_id": task_id, "error": str(error)},
+                    )
             return {
                 "asset_id": asset_id, "asset_version_id": version_id,
                 "status": prepared["status"], "missing_items": prepared["missing"],
-                "skipped": False,
+                "embedding_status": embedding_status, "skipped": False,
             }
         except Exception as error:
             code = error.code if isinstance(error, KnowledgeError) else "BUILD_FAILED"
@@ -802,31 +905,98 @@ async def search_knowledge(
             func.lower(KnowledgeAsset.title).like(pattern, escape="\\"),
             func.lower(KnowledgeChapter.title).like(pattern, escape="\\"),
         ))
-    filters = [
+    base_filters = [
         KnowledgeAsset.owner_scope == owner_scope,
         KnowledgeAsset.status.in_(SEARCHABLE_STATUSES),
         KnowledgeAsset.current_version_id == KnowledgeAssetVersion.id,
         KnowledgeChunk.content_type.in_(types),
-        or_(*term_filters),
     ]
     if asset_ids is not None:
-        filters.append(KnowledgeAsset.id.in_(asset_ids))
+        base_filters.append(KnowledgeAsset.id.in_(asset_ids))
+    keyword_filters = [*base_filters, or_(*term_filters)]
     async with async_session() as db:
         available_count = (await db.execute(select(func.count()).select_from(KnowledgeAsset).where(
             KnowledgeAsset.owner_scope == owner_scope,
             KnowledgeAsset.status.in_(SEARCHABLE_STATUSES),
             *([KnowledgeAsset.id.in_(asset_ids)] if asset_ids is not None else []),
         ))).scalar_one()
-        rows = (await db.execute(select(
+        keyword_rows = (await db.execute(select(
             KnowledgeChunk, KnowledgeAssetVersion, KnowledgeAsset, KnowledgeChapter
         ).join(KnowledgeAssetVersion, KnowledgeAssetVersion.id == KnowledgeChunk.asset_version_id
         ).join(KnowledgeAsset, KnowledgeAsset.id == KnowledgeAssetVersion.asset_id
         ).outerjoin(KnowledgeChapter, KnowledgeChapter.id == KnowledgeChunk.chapter_id
-        ).where(*filters).order_by(
+        ).where(*keyword_filters).order_by(
             KnowledgeAsset.updated_at.desc(), KnowledgeChapter.start_time.asc(), KnowledgeChunk.id.asc()
         ).limit(1000))).all()
+
+        semantic_scores: dict[str, float] = {}
+        semantic_rows = []
+        semantic_requested = ENABLE_KNOWLEDGE_SEMANTIC_SEARCH
+        if semantic_requested:
+            try:
+                from .embedding import embed_query
+
+                query_vector = await embed_query(query)
+                semantic_filter = [
+                    *base_filters,
+                    KnowledgeEmbedding.model_name == EMBEDDING_MODEL_NAME,
+                    KnowledgeEmbedding.model_version == EMBEDDING_MODEL_VERSION,
+                ]
+                semantic_query = select(
+                    KnowledgeEmbedding, KnowledgeChunk, KnowledgeAssetVersion,
+                    KnowledgeAsset, KnowledgeChapter,
+                ).join(
+                    KnowledgeChunk, KnowledgeChunk.id == KnowledgeEmbedding.chunk_id
+                ).join(
+                    KnowledgeAssetVersion,
+                    KnowledgeAssetVersion.id == KnowledgeChunk.asset_version_id,
+                ).join(
+                    KnowledgeAsset, KnowledgeAsset.id == KnowledgeAssetVersion.asset_id
+                ).outerjoin(
+                    KnowledgeChapter, KnowledgeChapter.id == KnowledgeChunk.chapter_id
+                ).where(*semantic_filter)
+                if DATABASE_URL.startswith("postgresql"):
+                    distance = KnowledgeEmbedding.embedding.op("<=>")(query_vector)
+                    semantic_rows = (await db.execute(
+                        semantic_query.add_columns(distance.label("_distance"))
+                        .order_by(distance)
+                        .limit(SEMANTIC_RECALL_K)
+                    )).all()
+                    for _, chunk, _, _, _, distance_value in semantic_rows:
+                        if distance_value is not None:
+                            semantic_scores[chunk.id] = max(
+                                0.0, min(1.0, 1.0 - float(distance_value))
+                            )
+                    semantic_rows = [row[:5] for row in semantic_rows]
+                else:
+                    # SQLite remains the zero-setup Demo fallback. It stores
+                    # JSON vectors and computes cosine similarity in Python;
+                    # PostgreSQL uses the pgvector HNSW path above.
+                    candidates = (await db.execute(
+                        semantic_query.limit(max(SEMANTIC_RECALL_K * 20, 1000))
+                    )).all()
+                    for embedding, chunk, version, asset, chapter in candidates:
+                        vector = embedding.embedding
+                        if not vector:
+                            continue
+                        similarity = sum(a * b for a, b in zip(vector, query_vector))
+                        semantic_scores[chunk.id] = max(0.0, min(1.0, float(similarity)))
+                        semantic_rows.append((chunk, version, asset, chapter))
+                    semantic_rows.sort(
+                        key=lambda row: semantic_scores.get(row[0].id, 0.0), reverse=True
+                    )
+                    semantic_rows = semantic_rows[:SEMANTIC_RECALL_K]
+            except Exception as error:
+                logger.info("semantic_search_fallback", extra={"reason": str(error)})
+
+        rows_by_chunk = {
+            chunk.id: (chunk, version, asset, chapter)
+            for chunk, version, asset, chapter in keyword_rows
+        }
+        for row in semantic_rows:
+            rows_by_chunk.setdefault(row[0].id, row)
         media_by_version: dict[str, list[KnowledgeMedia]] = defaultdict(list)
-        version_ids = {row[1].id for row in rows}
+        version_ids = {row[1].id for row in rows_by_chunk.values()}
         if version_ids:
             media_rows = (await db.execute(select(KnowledgeMedia).where(
                 KnowledgeMedia.asset_version_id.in_(version_ids)
@@ -834,13 +1004,15 @@ async def search_knowledge(
             for media_row in media_rows:
                 media_by_version[media_row.asset_version_id].append(media_row)
         results = []
-        for chunk, version, asset, chapter in rows:
+        semantic_active = bool(semantic_scores)
+        for chunk, version, asset, chapter in rows_by_chunk.values():
             lowered_terms = [term.lower() for term in terms]
             title_hit = any(term in asset.title.lower() for term in lowered_terms)
             chapter_hit = bool(chapter and any(term in chapter.title.lower() for term in lowered_terms))
             chunk_title_hit = any(term in (chunk.title or "").lower() for term in lowered_terms)
             occurrences = sum(chunk.text.lower().count(term) for term in lowered_terms) + int(title_hit) + int(chapter_hit)
-            keyword = min(1.0, 0.55 + 0.15 * max(0, occurrences - 1))
+            has_keyword = bool(title_hit or chapter_hit or chunk_title_hit or occurrences)
+            keyword = min(1.0, 0.55 + 0.15 * max(0, occurrences - 1)) if has_keyword else 0.0
             field_score = 1.0 if title_hit else 0.8 if chapter_hit or chunk_title_hit else 0.4
             timed = chunk.start_time is not None and chunk.end_time is not None
             evidence = 1.0 if timed else 0.6
@@ -851,7 +1023,16 @@ async def search_knowledge(
                 media = min(candidates, key=lambda item: abs(item.timestamp - chunk.start_time)) if candidates else None
                 evidence = 1.0 if media else 0.8
             matched_field = "asset_title" if title_hit else "chapter_title" if chapter_hit else "content_title" if chunk_title_hit else "text"
-            score = round(0.75 * keyword + 0.15 * field_score + 0.10 * evidence, 6)
+            if semantic_active:
+                if not has_keyword:
+                    matched_field = "semantic"
+                score = round(
+                    0.45 * keyword + 0.45 * semantic_scores.get(chunk.id, 0.0)
+                    + 0.10 * evidence,
+                    6,
+                )
+            else:
+                score = round(0.75 * keyword + 0.15 * field_score + 0.10 * evidence, 6)
             results.append({
                 "chunk_id": chunk.id, "asset_id": asset.id,
                 "task_id": asset.task_id,
@@ -876,7 +1057,8 @@ async def search_knowledge(
         response = {
             "query": query, "scope": {"asset_ids": asset_ids, "owner_scope": owner_scope},
             "results": results, "total": len(results), "available_assets": available_count,
-            "degraded_search": False,
+            "degraded_search": semantic_requested and not semantic_active,
+            "retrieval_mode": "hybrid" if semantic_active else "keyword",
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
         }
         logger.info("knowledge_search_completed", extra={

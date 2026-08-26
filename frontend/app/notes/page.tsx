@@ -295,6 +295,13 @@ export default function NotesPage() {
               </div>
             ) : searchResponse?.results.length ? (
               <div className="search-result-list">
+                <div className="search-result-mode" role="status">
+                  {searchResponse.retrieval_mode === "hybrid"
+                    ? "语义 + 关键词混合检索"
+                    : searchResponse.degraded_search
+                      ? "当前使用关键词检索，语义索引尚未就绪"
+                      : "关键词检索"}
+                </div>
                 {searchResponse.results.map((hit) => (
                   <button className="search-result-card" type="button" key={hit.chunk_id} onClick={() => openSearchHit(hit.task_id, hit.start_time)}>
                     {hit.keyframe?.availability === "available" && hit.keyframe.relative_uri ? (

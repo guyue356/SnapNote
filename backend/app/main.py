@@ -35,8 +35,10 @@ from .knowledge import (
     get_transcript,
     list_assets as list_knowledge_assets,
     remove_knowledge_for_task,
+    rebuild_knowledge_embeddings,
     search_knowledge,
 )
+from .embedding import EmbeddingUnavailable
 from .pipeline import new_processing_state, reset_task, run_pipeline
 from .schemas import KnowledgeSearchRequest, RetryRequest, TaskCreated
 from .sse_manager import sse_manager
@@ -222,6 +224,19 @@ async def knowledge_search(payload: KnowledgeSearchRequest):
             content_types=payload.content_types, top_k=payload.top_k,
             owner_scope=payload.owner_scope,
         )
+    except KnowledgeError as error:
+        raise HTTPException(422, {"code": error.code, "summary": error.summary}) from None
+
+
+@app.post("/api/knowledge/assets/{asset_id}/embeddings/rebuild")
+async def rebuild_asset_embeddings(asset_id: str, owner_scope: str = "local"):
+    """Explicitly generate the optional semantic index for one asset."""
+    try:
+        return await rebuild_knowledge_embeddings(
+            asset_id=asset_id, owner_scope=owner_scope
+        )
+    except EmbeddingUnavailable as error:
+        raise HTTPException(503, str(error)) from None
     except KnowledgeError as error:
         raise HTTPException(422, {"code": error.code, "summary": error.summary}) from None
 

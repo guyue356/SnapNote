@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -13,6 +13,7 @@ from app.database import (
     KnowledgeAssetVersion,
     KnowledgeChapter,
     KnowledgeChunk,
+    KnowledgeEmbedding,
     KnowledgeMedia,
     KnowledgeTranscriptSegment,
     SnapTask,
@@ -149,6 +150,29 @@ class KnowledgeAssetIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "注意力", asset_ids=[result["asset_id"]]
         )
         self.assertGreater(search["total"], 0)
+
+    async def test_sqlite_semantic_index_is_rebuildable_and_combines_with_keyword_search(self):
+        await self.create_task()
+        built = await knowledge.build_knowledge_asset("task-ready")
+        vector = [1.0] + [0.0] * 1023
+        with patch("app.embedding.embed_texts", new=AsyncMock(side_effect=lambda texts: [vector for _ in texts])), \
+                patch.object(knowledge, "ENABLE_KNOWLEDGE_SEMANTIC_SEARCH", True):
+            indexed = await knowledge.rebuild_knowledge_embeddings(
+                asset_id=built["asset_id"]
+            )
+            result = await knowledge.search_knowledge(
+                "一个完全不同的自然语言问题", asset_ids=[built["asset_id"]]
+            )
+
+        self.assertEqual(indexed["status"], "ready")
+        self.assertGreater(indexed["indexed"], 0)
+        self.assertEqual(result["retrieval_mode"], "hybrid")
+        self.assertGreater(result["total"], 0)
+        self.assertEqual(result["results"][0]["matched_field"], "semantic")
+        async with self.Session() as db:
+            self.assertGreater(
+                await db.scalar(select(func.count()).select_from(KnowledgeEmbedding)), 0
+            )
 
     async def test_remove_cascades_all_derived_entities(self):
         await self.create_task()

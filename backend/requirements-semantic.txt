@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Loads Qwen/Qwen3-Embedding-0.6B lazily for local semantic retrieval.
+sentence-transformers>=5.1

@@ -3,6 +3,8 @@ uvicorn[standard]>=0.30
 python-multipart>=0.0.9
 sqlalchemy>=2.0
 aiosqlite>=0.20
+asyncpg>=0.29
+pgvector>=0.3
 aiofiles>=24.1
 sse-starlette>=2.1
 pydantic>=2.8
@@ -10,6 +12,8 @@ python-dotenv>=1.0
 Pillow>=10.0
 ImageHash>=4.3
 numpy>=1.26
+# Optional semantic retrieval runtime. The model itself is downloaded lazily.
+# sentence-transformers>=5.1
 # Required by the default, real local ASR pipeline:
 faster-whisper>=1.1
 # Optional heavyweight OCR provider:

@@ -29,6 +29,20 @@ ENABLE_KNOWLEDGE_STATUS_UI = _flag("ENABLE_KNOWLEDGE_STATUS_UI")
 ENABLE_KNOWLEDGE_REBUILD = _flag("ENABLE_KNOWLEDGE_REBUILD")
 KNOWLEDGE_OWNER_SCOPE = os.getenv("KNOWLEDGE_OWNER_SCOPE", "local").strip() or "local"
 
+# Semantic retrieval is deliberately optional.  The relational knowledge model
+# and keyword search remain the fallback so the local SQLite demo still works
+# without downloading a model or running PostgreSQL.
+ENABLE_KNOWLEDGE_EMBEDDINGS = _flag("ENABLE_KNOWLEDGE_EMBEDDINGS", "0")
+ENABLE_KNOWLEDGE_SEMANTIC_SEARCH = _flag("ENABLE_KNOWLEDGE_SEMANTIC_SEARCH", "1")
+EMBEDDING_MODEL_NAME = os.getenv(
+    "EMBEDDING_MODEL_NAME", "Qwen/Qwen3-Embedding-0.6B"
+).strip()
+EMBEDDING_MODEL_VERSION = os.getenv("EMBEDDING_MODEL_VERSION", "default").strip() or "default"
+EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
+EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "16"))
+EMBEDDING_DEVICE = os.getenv("EMBEDDING_DEVICE", "auto").strip().lower() or "auto"
+SEMANTIC_RECALL_K = int(os.getenv("SEMANTIC_RECALL_K", "60"))
+
 DEFAULT_ASR_PROVIDER = os.getenv("DEFAULT_ASR_PROVIDER", "whisper").strip().lower()
 if DEFAULT_ASR_PROVIDER not in {"whisper", "mimo"}:
     DEFAULT_ASR_PROVIDER = "whisper"

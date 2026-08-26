@@ -56,7 +56,7 @@ ASR 可在本机 Whisper 与 MIMO-ASR 间选择；视觉统一使用 `mimo-v2.5`
 
 ### 6. 版本化知识资产与可引用检索
 
-完成任务会自动派生 `KnowledgeAsset`，并按来源哈希、Schema 版本和 Builder 版本管理不可变版本。系统提供资产、章节、原文和关键帧只读接口，以及中文关键词检索；每条命中都返回稳定分块 ID、来源版本、时间范围和受控媒体引用。
+完成任务会自动派生 `KnowledgeAsset`，并按来源哈希、Schema 版本和 Builder 版本管理不可变版本。系统提供资产、章节、原文和关键帧只读接口，以及中文关键词检索；安装并启用可选 Embedding 后还支持混合语义检索。每条命中都返回稳定分块 ID、来源版本、时间范围和受控媒体引用。
 
 构建失败不会改变原视频任务的完成状态。历史数据支持 `dry-run`、正式执行、失败重试和强制重建；相同来源重复执行会直接跳过，不产生重复实体。
 
@@ -182,6 +182,15 @@ python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 43872
 
 FastAPI 启动时会幂等执行数据库迁移：已有 `snap_tasks` 数据保持不变，并补充知识资产相关表与索引。生产或重要本地数据升级前，仍建议先备份 `storage/app.db`。
 
+如需启用可选语义检索，在后端环境中额外安装 Embedding 依赖，并在 `backend/.env` 开启索引生成：
+
+```powershell
+pip install -r requirements-semantic.txt
+# ENABLE_KNOWLEDGE_EMBEDDINGS=1
+```
+
+Embedding 模型按首次使用时惰性加载；不启用或模型不可用时，基础 SQLite Demo 仍可使用关键词检索。
+
 前端需要在另一个终端中启动：
 
 ```powershell
@@ -298,7 +307,7 @@ flowchart TD
     Files --> Builder
     Builder --> KnowledgeDB[("版本化知识实体")]
     KnowledgeDB --> Query
-    Query -->|"范围过滤与关键词检索"| API
+    Query -->|"范围过滤与关键词/混合检索"| API
 ```
 
 | 模块 | 职责 |
@@ -307,7 +316,7 @@ flowchart TD
 | FastAPI | 文件校验、任务 API、知识只读 API、SSE、视频与 Markdown 文件响应 |
 | Pipeline | 视频解析、ASR、镜头检测、关键帧择优、动态代理、MiMo 理解、对齐和结果生成 |
 | Knowledge Builder | 从现有 JSON 与媒体元数据派生稳定、幂等、可重建的知识版本，不调用外部 AI |
-| Knowledge Query | 统一处理资产范围、状态过滤、中文关键词评分、时间引用和媒体可用性 |
+| Knowledge Query | 统一处理资产范围、状态过滤、关键词/语义召回、时间引用和媒体可用性 |
 | SQLAlchemy async | 保存任务快照、阶段历史、Schema Migration 和规范知识实体 |
 | 本地文件系统 | 按 UUID 隔离存储原视频、音频、关键帧和导出文件 |
 | Provider 层 | Whisper / MIMO-ASR 双转写；MiMo v2.5 图片、视频与结构化输出复用同一 API Key |
@@ -381,9 +390,9 @@ flowchart LR
 
 所有实体使用稳定 UUID；空白、纯标点和规范化后重复的文本不会进入检索。时间统一为秒并限制在视频时长内，媒体引用必须仍位于对应任务目录。
 
-### 一期关键词检索
+### 关键词与语义检索
 
-一期不生成 Embedding，也不调用模型重排，而是在明确的 `owner_scope` 与资产范围内做中文子串匹配。候选结果按以下可解释公式评分：
+基础检索不依赖 Embedding，而是在明确的 `owner_scope` 与资产范围内做中文子串匹配。启用语义索引后，系统在同一范围内叠加 Qwen3 Embedding 召回，保留关键词检索作为降级路径。候选结果按以下可解释公式评分：
 
 ```text
 final_score = 0.75 × keyword_relevance
@@ -396,11 +405,24 @@ final_score = 0.75 × keyword_relevance
 - 默认只检索 `ready` 与 `degraded` 当前版本，`building`、`failed` 和 `deleting` 不会泄漏到结果；
 - `%`、`_` 和 SQL 片段均按普通查询文本处理，调用方不能传入 SQL 或任意文件路径。
 
+语义索引是可删除、可重建的派生数据，不改变知识资产、原文证据或引用契约：
+
+- SQLite 将向量以 JSON 文本保存，并在查询时计算余弦相似度，适合零额外服务的本地 Demo；
+- PostgreSQL 使用 `pgvector` 列和 HNSW 索引，适合规模化语义召回；
+- `ENABLE_KNOWLEDGE_EMBEDDINGS=1` 时，新知识资产构建完成后会尝试自动生成索引，失败不会把可用资产改成失败；
+- 也可以只为已有资产手动重建，并按资产或所有者范围限制任务：
+
+```powershell
+cd backend
+conda run -n snapnote python -m app.embed_knowledge
+conda run -n snapnote python -m app.embed_knowledge --asset-id <asset-id> --owner-scope local
+```
+
 ---
 
 ## AI 工作流程
 
-SnapNote 当前采用确定性的流水线编排，不是多 Agent 系统，也没有生成式 RAG 或向量数据库。知识层先交付可验证的关键词检索与引用契约，为后续混合检索或问答助手保留边界；这样的设计减少了当前阶段的基础设施依赖，让每个处理阶段都可以独立记录、诊断和降级。
+SnapNote 当前采用确定性的流水线编排，不是多 Agent 系统。知识层以关系数据和引用契约为事实源；启用语义检索时，Embedding 作为可重建索引存储，不能替代权限过滤、原文证据或时间引用。未安装模型依赖、未生成向量或 PostgreSQL 不可用时，接口会自动降级到关键词检索。
 
 ### ASR
 
@@ -456,8 +478,9 @@ flowchart LR
 | 前端 | Vinext 0.0.50、React 19、TypeScript 5.9 | App Router 页面与交互 | 保留 Next 风格开发体验并输出 Cloudflare Worker 兼容构建 |
 | 样式 | Tailwind CSS 4 + 项目级 CSS | 响应式视觉系统 | 轻量、可维护，适合快速构建产品 Demo |
 | 后端 | FastAPI、Uvicorn | 异步 API 与自动文档 | 上传、SSE 和文件响应实现直接 |
-| ORM | SQLAlchemy 2 async、aiosqlite | 任务与阶段结果持久化 | 单机 Demo 无需独立数据库服务 |
-| 知识资产 | 版本化 SQLite 实体、稳定 UUID、来源哈希、受控关键词检索 | 规范章节、原文、分块与媒体引用 | 在不引入向量库的前提下先建立可重建、可审计的查询边界 |
+| ORM / 数据库 | SQLAlchemy 2 async、aiosqlite、asyncpg | 任务、阶段结果与知识实体持久化 | SQLite 零配置；PostgreSQL 可接入生产语义检索 |
+| 知识资产 | 版本化关系实体、稳定 UUID、来源哈希、关键词与可选向量索引 | 规范章节、原文、分块与媒体引用 | 向量是可重建查询索引，关系数据仍是事实源 |
+| 语义检索 | sentence-transformers、Qwen3 Embedding、pgvector | 本地向量生成、SQLite 余弦召回与 PostgreSQL HNSW 召回 | 作为可选派生索引，不影响关键词降级与引用安全边界 |
 | 实时通信 | SSE / `sse-starlette` | 处理阶段与心跳推送 | 单向进度流比 WebSocket 更简单 |
 | 媒体处理 | ffmpeg、ffprobe | 元信息、音频与关键帧 | 格式支持成熟，命令行集成稳定 |
 | ASR | faster-whisper / MIMO-ASR | 带时间戳语音识别 | 本机权重低成本主路径，云端可选 |
@@ -487,7 +510,8 @@ flowchart LR
 | `POST` | `/api/snapnote/tasks/{task_id}/knowledge/rebuild` | 仅使用现有产物重建知识资产 |
 | `GET` | `/api/knowledge/assets` | 分页列出知识资产 |
 | `GET` | `/api/knowledge/assets/{asset_id}` | 获取资产摘要和章节目录 |
-| `POST` | `/api/knowledge/search` | 在受控范围内执行中文关键词检索 |
+| `POST` | `/api/knowledge/search` | 在受控范围内执行中文关键词或混合语义检索 |
+| `POST` | `/api/knowledge/assets/{asset_id}/embeddings/rebuild` | 为单个资产生成或重建语义索引 |
 | `GET` | `/api/knowledge/chapters/{chapter_id}` | 获取章节和关联画面 |
 | `GET` | `/api/knowledge/assets/{asset_id}/transcript` | 按时间范围读取原文 |
 | `GET` | `/api/knowledge/media/{media_id}` | 获取受控关键帧引用 |
@@ -510,7 +534,7 @@ curl -X POST "http://127.0.0.1:43872/api/snapnote/tasks" \
 }
 ```
 
-范围内关键词检索示例：
+范围内检索示例：
 
 ```powershell
 curl.exe -X POST "http://127.0.0.1:43872/api/knowledge/search" `
@@ -518,9 +542,9 @@ curl.exe -X POST "http://127.0.0.1:43872/api/knowledge/search" `
   -d '{"query":"缩放点积注意力","asset_ids":["<asset-id>"],"content_types":["chapter_summary","transcript"],"top_k":8,"owner_scope":"local"}'
 ```
 
-每条结果至少包含 `chunk_id`、`asset_id`、`asset_version_id`、内容类型、命中文本、相关度、来源状态，以及可用的章节、时间和关键帧引用。搜索词长度限制为 1–500 字符，`top_k` 为 1–20，单次显式资产范围最多 100 条。
+每条结果至少包含 `chunk_id`、`asset_id`、`asset_version_id`、内容类型、命中文本、相关度、来源状态，以及可用的章节、时间和关键帧引用。响应中的 `retrieval_mode` 会标识当前使用 `hybrid` 还是 `keyword`，`degraded_search=true` 表示语义路径不可用并已降级。搜索词长度限制为 1–500 字符，`top_k` 为 1–20，单次显式资产范围最多 100 条。
 
-历史任务可先预览、再执行幂等回填；该命令只读取已有 JSON 和媒体元数据，不会调用任何 AI 服务：
+历史任务可先预览、再执行幂等回填；该命令不会重新调用 ASR、OCR、MiMo 或 DeepSeek 等外部服务。若开启 `ENABLE_KNOWLEDGE_EMBEDDINGS=1`，正式执行时会额外运行本地 Embedding 模型：
 
 ```powershell
 cd backend
@@ -540,6 +564,7 @@ flowchart TD
     Version --> Chapter["KnowledgeChapter 章节"]
     Version --> Transcript["KnowledgeTranscriptSegment 原文"]
     Version --> Chunk["KnowledgeChunk 检索分块"]
+    Chunk --> Embedding["KnowledgeEmbedding 可重建语义索引"]
     Version --> Media["KnowledgeMedia 媒体引用"]
     Chapter --> Chunk
 ```
@@ -570,6 +595,7 @@ flowchart TD
 | `knowledge_chapters` | 保存章节顺序、标题、概要和时间范围 | 同版本章节序号唯一，按时间升序 |
 | `knowledge_transcript_segments` | 保存未经摘要替代的原文片段 | 同版本来源序号唯一，保留内容哈希 |
 | `knowledge_chunks` | 保存 `video_summary`、`chapter_summary`、`transcript`、`note` 检索单元 | 来源引用必填，同版本相同内容哈希去重 |
+| `knowledge_embeddings` | 保存分块的可重建 Embedding 索引 | 同一分块、模型和模型版本唯一；删除分块时级联 |
 | `knowledge_media` | 保存关键帧相对引用、时间和可用性 | 不保存绝对路径或二进制，同版本 `frame_id` 唯一 |
 | `knowledge_build_runs` | 保存自动构建、回填和手动重建的状态与统计 | 同资产最多一个 `running` 构建，卡住运行可恢复 |
 
@@ -589,13 +615,16 @@ SnapNote/
 │   │   ├── knowledge.py        # 知识构建、分块、版本、查询与删除治理
 │   │   ├── backfill_knowledge.py
 │   │   │                       # 历史知识资产预览与幂等回填 CLI
+│   │   ├── embedding.py         # 惰性加载本地 Embedding 模型
+│   │   ├── embed_knowledge.py   # 已有知识资产的语义索引重建 CLI
 │   │   ├── database.py         # SQLAlchemy 模型、迁移与完整性约束
 │   │   ├── config.py           # 环境变量、存储和 ffmpeg 探测
 │   │   ├── schemas.py          # API 请求与响应 Schema
 │   │   └── sse_manager.py      # 订阅者队列与近期事件历史
 │   ├── tests/                   # ASR、视觉、知识幂等、检索与删除测试
 │   ├── .env.example            # 后端配置模板
-│   └── requirements.txt        # Python 依赖
+│   ├── requirements.txt        # 基础 Python 依赖
+│   └── requirements-semantic.txt # 可选语义检索依赖
 ├── frontend/
 │   ├── app/
 │   │   ├── page.tsx            # 上传首页与最近任务
@@ -640,6 +669,14 @@ SnapNote/
 | `ENABLE_KNOWLEDGE_SEARCH` | 否 | `1` | 是否启用只读关键词检索 |
 | `ENABLE_KNOWLEDGE_STATUS_UI` | 否 | `1` | 是否在任务详情响应中返回知识状态 |
 | `ENABLE_KNOWLEDGE_REBUILD` | 否 | `1` | 是否允许用户仅用现有产物重建知识资产 |
+| `ENABLE_KNOWLEDGE_EMBEDDINGS` | 否 | `0` | 新资产完成后是否自动生成 Embedding |
+| `ENABLE_KNOWLEDGE_SEMANTIC_SEARCH` | 否 | `1` | 是否尝试语义 + 关键词混合检索；不可用时降级 |
+| `EMBEDDING_MODEL_NAME` | 否 | `Qwen/Qwen3-Embedding-0.6B` | 本地 Embedding 模型 |
+| `EMBEDDING_MODEL_VERSION` | 否 | `default` | Embedding 索引版本；模型变更后用于区分并重建索引 |
+| `EMBEDDING_DIMENSIONS` | 否 | `1024` | 向量维度，需与 pgvector 列一致 |
+| `EMBEDDING_BATCH_SIZE` | 否 | `16` | 批量生成向量的分块数量 |
+| `EMBEDDING_DEVICE` | 否 | `auto` | Embedding 推理设备 |
+| `SEMANTIC_RECALL_K` | 否 | `60` | 语义召回候选数量，之后与关键词结果合并排序 |
 | `KNOWLEDGE_OWNER_SCOPE` | 否 | `local` | 本地单用户知识范围标识 |
 | `DEFAULT_ASR_PROVIDER` | 否 | `whisper` | 未指定时使用的 ASR Provider |
 | `ENABLE_LOCAL_WHISPER` | 否 | `1` | 是否启用本地 Whisper |
@@ -648,6 +685,7 @@ SnapNote/
 | `WHISPER_DEVICE` | 否 | 自动检测 | 可显式设置 `cpu` 或 `cuda` |
 | `WHISPER_COMPUTE_TYPE` | 否 | 自动选择 | CPU 默认 `int8`，CUDA 默认 `int8_float16` |
 | `WHISPER_CACHE_DIR` | 否 | 当前用户的 Hugging Face Hub 缓存 | 复用已下载的 Whisper 权重 |
+| `HF_HUB_CACHE` | 否 | 当前用户的 Hugging Face Hub 缓存 | 未设置 `WHISPER_CACHE_DIR` 时作为默认模型缓存目录 |
 | `MIMO_API_KEY` | 使用 MIMO 时 | 空 | MIMO-ASR 与 MiMo 视觉共用的 API Key |
 | `MIMO_BASE_URL` | 否 | 根据 Key 自动选择 | `tp-` Key 默认使用 Token Plan 地址 |
 | `MIMO_ASR_MODEL` | 否 | `mimo-v2.5-asr` | MIMO-ASR 模型名 |
@@ -701,8 +739,8 @@ SnapNote/
 - **主要瓶颈**：本地 Whisper、场景扫描解码、PaddleOCR 与 MiMo 请求会消耗 GPU/CPU、网络和 Token。
 - **当前并发模型**：任务通过 FastAPI `BackgroundTasks` 在应用进程内执行，适合单机 Demo，不适合高并发生产环境。
 - **视觉成本控制**：本地低分辨率扫描免费；只上传最多 24 张 736px 关键帧，并仅给最多 4 个动态/不确定镜头补充无声短视频。
-- **知识构建成本**：只读取已有 SQLite 快照与媒体元数据，不重新解码视频，也不发起 ASR、OCR、MiMo 或 DeepSeek 请求；相同来源与版本直接跳过。
-- **检索边界**：查询先按所有者、资产状态、显式资产范围和内容类型过滤，再对最多 1000 个候选做可解释评分；单次最多返回 20 条结果。
+- **知识构建成本**：基础知识构建只读取已有 SQLite 快照与媒体元数据，不重新解码视频，也不发起 ASR、OCR、MiMo 或 DeepSeek 请求；相同来源与版本直接跳过。若显式开启 Embedding，额外执行本地向量生成。
+- **检索边界**：查询先按所有者、资产状态、显式资产范围和内容类型过滤，再执行关键词或混合召回；单次最多返回 20 条结果，向量索引不可绕过关系数据过滤。
 - **一期验收目标**：面向本地单用户、1000 条资产、10 万分块，目标为单资产读取 P95 ≤ 300 ms、范围内检索 P95 ≤ 1 秒。该目标仍需使用实际 10 条样本与规模数据持续评测。
 - **可扩展方向**：将任务编排迁移到独立队列，将 SQLite 升级为 PostgreSQL，将文件迁移到对象存储，并为 ASR/OCR 设置独立工作池。
 - **前端性能**：结果页优先加载关键帧缩略图；在线演示构建为 Cloudflare Worker 兼容 ESM。
@@ -746,7 +784,7 @@ conda run -n snapnote python -c "from app.main import app; print(app.title)"
 conda run -n snapnote python -m unittest discover -s tests -v
 ```
 
-知识测试覆盖完整构建、缺媒体降级、损坏 JSON 隔离、来源变化生成新版本、重复构建幂等、中文关键词与通配符转义、原文范围读取、媒体路径穿越和级联删除。当前完整回归为后端 23 项、前端服务端渲染 2 项，且前端 lint 与生产构建通过。
+知识测试覆盖完整构建、缺媒体降级、损坏 JSON 隔离、来源变化生成新版本、重复构建幂等、中文关键词与通配符转义、SQLite 语义索引、原文范围读取、媒体路径穿越和级联删除。当前完整回归为后端 24 项、前端服务端渲染 3 项，且前端 lint 与生产构建通过。
 
 ---
 
@@ -757,7 +795,7 @@ conda run -n snapnote python -m unittest discover -s tests -v
 3. **非 PPT 限定的视觉画像**：真实识别人物、动作、运镜、构图、剪辑节奏、爆款元素与 storyboard。
 4. **双模式交付**：同一套前端既可作为无需服务端的产品 Demo，也能连接本地多模态后端处理真实视频。
 5. **可重建知识边界**：旧 JSON 保持事实快照，新实体通过稳定 ID、来源哈希和不可变版本形成查询层，失败不污染原任务。
-6. **可引用而非黑盒搜索**：关键词命中同时返回章节、原文时间和画面引用，后续 AI 助手可以直接复用契约并回到原视频核验。
+6. **可引用而非黑盒搜索**：关键词或语义命中同时返回章节、原文时间和画面引用，后续 AI 助手可以直接复用契约并回到原视频核验。
 7. **边缘友好前端**：Vinext 输出 Cloudflare Worker 兼容构建，同时保留 React App Router 的开发方式。
 
 ---
@@ -781,7 +819,8 @@ conda run -n snapnote python -m unittest discover -s tests -v
 - [x] 中文关键词检索与六类只读知识接口
 - [x] 知识状态、重建确认和删除一致性 UI
 - [ ] 使用 10 条真实样本完成知识资产人工抽验与规模性能基准
-- [ ] 引入 Embedding、混合检索和证据重排
+- [x] 可选 Qwen3 Embedding、SQLite Demo 语义降级与 PostgreSQL/pgvector 混合检索
+- [ ] 基于真实问题集完成语义召回评测与证据重排
 - [ ] 基于当前引用契约实现 MiMo 问答助手与 MCP 工具
 - [ ] 支持单帧删除、重复页面合并和标题编辑
 - [ ] 支持单阶段 OCR / ASR / 笔记重新执行
@@ -837,11 +876,17 @@ conda run -n snapnote python -m unittest discover -s tests -v
 
 ### 历史回填会重新调用模型或产生 API 费用吗？
 
-不会。`app.backfill_knowledge` 只读取现有 JSON、Markdown 和媒体元数据，不调用 Whisper、MIMO-ASR、OCR、MiMo 或 DeepSeek。建议先运行 `--dry-run`，确认候选与失败原因后再使用 `--execute`。
+不会。`app.backfill_knowledge` 不会重新调用 Whisper、MIMO-ASR、OCR、MiMo 或 DeepSeek；若开启 `ENABLE_KNOWLEDGE_EMBEDDINGS=1`，正式回填会额外运行本地 Embedding 模型。建议先运行 `--dry-run`，确认候选与失败原因后再使用 `--execute`。
 
-### 为什么知识检索没有使用向量数据库？
+### 如何启用语义检索？
 
-一期先建立稳定身份、来源、版本、范围过滤和引用契约，并交付中文关键词基线。这样可以先验证“命中能否回到原视频核验”，避免过早引入 Embedding 成本与双写复杂度；后续会在不改变返回契约的前提下增加混合检索。
+默认仍可用 SQLite 运行 Demo；要生成本地向量，先安装 `backend/requirements-semantic.txt`，设置 `ENABLE_KNOWLEDGE_EMBEDDINGS=1`，然后执行：
+
+```powershell
+conda run -n snapnote python -m app.embed_knowledge
+```
+
+配置 PostgreSQL 时使用 `postgresql+asyncpg://...`，启动时会创建 `vector` 扩展。生产路径推荐 PostgreSQL + pgvector；向量记录位于 `knowledge_embeddings`，知识资产、原文、权限和引用仍由关系模型负责。
 
 ### 删除视频后知识数据如何处理？
 

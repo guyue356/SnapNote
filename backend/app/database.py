@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 
 from sqlalchemy import (
     DateTime,
@@ -12,10 +13,47 @@ from sqlalchemy import (
     event,
     text,
 )
+from sqlalchemy.types import TypeDecorator
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from .config import DATABASE_URL
+from .config import DATABASE_URL, EMBEDDING_DIMENSIONS
+
+try:
+    from pgvector.sqlalchemy import Vector as PgVector
+except ImportError:  # Keep the default SQLite demo install lightweight.
+    PgVector = None
+
+
+class EmbeddingVector(TypeDecorator):
+    """pgvector on PostgreSQL and JSON text on the local SQLite fallback."""
+
+    impl = Text
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "postgresql":
+            if PgVector is None:
+                raise RuntimeError(
+                    "PostgreSQL semantic retrieval requires the pgvector package"
+                )
+            return dialect.type_descriptor(PgVector(EMBEDDING_DIMENSIONS))
+        return dialect.type_descriptor(Text())
+
+    def process_bind_param(self, value, dialect):
+        if value is None or dialect.name == "postgresql":
+            return value
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    def process_result_value(self, value, dialect):
+        if value is None or dialect.name == "postgresql":
+            return value
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return None
+        return value
 
 
 def utcnow():
@@ -174,6 +212,42 @@ class KnowledgeChunk(Base):
     content_hash: Mapped[str] = mapped_column(String(64), index=True)
 
 
+class KnowledgeEmbedding(Base):
+    """Rebuildable semantic index for a knowledge chunk.
+
+    The chunk and its asset version remain the source of truth. This table is
+    safe to delete and regenerate when the embedding model changes.
+    """
+
+    __tablename__ = "knowledge_embeddings"
+    __table_args__ = (
+        UniqueConstraint(
+            "chunk_id", "model_name", "model_version",
+            name="uq_knowledge_embedding_chunk_model",
+        ),
+        Index("ix_knowledge_embedding_version", "asset_version_id"),
+        Index(
+            "ix_knowledge_embedding_vector_hnsw", "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    chunk_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("knowledge_chunks.id", ondelete="CASCADE"), index=True
+    )
+    asset_version_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("knowledge_asset_versions.id", ondelete="CASCADE"), index=True
+    )
+    model_name: Mapped[str] = mapped_column(String(200))
+    model_version: Mapped[str] = mapped_column(String(100), default="default")
+    dimensions: Mapped[int] = mapped_column(Integer, default=EMBEDDING_DIMENSIONS)
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    embedding: Mapped[list[float] | None] = mapped_column(EmbeddingVector(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class KnowledgeMedia(Base):
     __tablename__ = "knowledge_media"
     __table_args__ = (
@@ -232,6 +306,8 @@ if DATABASE_URL.startswith("sqlite"):
 
 async def init_db():
     async with engine.begin() as connection:
+        if DATABASE_URL.startswith("postgresql"):
+            await connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await connection.execute(text(
             "CREATE TABLE IF NOT EXISTS schema_migrations ("
             "version INTEGER PRIMARY KEY, name VARCHAR(200) NOT NULL, "
@@ -270,4 +346,13 @@ async def init_db():
                 text("INSERT INTO schema_migrations(version, name, applied_at) "
                      "VALUES (1, :name, :applied_at)"),
                 {"name": "knowledge_asset_schema_v1", "applied_at": utcnow()},
+            )
+        vector_migration = (await connection.execute(text(
+            "SELECT version FROM schema_migrations WHERE version = 2"
+        ))).first()
+        if not vector_migration:
+            await connection.execute(
+                text("INSERT INTO schema_migrations(version, name, applied_at) "
+                     "VALUES (2, :name, :applied_at)"),
+                {"name": "knowledge_embedding_index_v1", "applied_at": utcnow()},
             )
