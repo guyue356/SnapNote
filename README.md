@@ -1,3 +1,5 @@
+
+https://github.com/user-attachments/assets/fc575fcf-7d6e-4e3b-b2ed-a765126b5be3
 <div align="center">
 
 <img src="./docs/images/snapnote-cover.png" alt="SnapNote：把视频变成可复习的图文笔记" width="100%" />
@@ -74,11 +76,11 @@ ASR 可在本机 Whisper 与 MIMO-ASR 间选择；视觉统一使用 `mimo-v2.5`
 
 ### 产品演示视频
 
-[![观看 SnapNote 产品演示视频](./docs/images/snapnote-video-cover.jpg)](./docs/videos/snapnote-promo.mp4)
 
-**[▶ 观看产品演示（MP4，约 28 MB）](./docs/videos/snapnote-promo.mp4)**
 
-从视频上传、处理进度，到知识资产检索和知识助手，查看 SnapNote 的主要使用界面。点击封面或链接打开成片；若当前阅读器无法播放，可下载后观看。
+https://github.com/user-attachments/assets/c2cac831-f2f6-4d42-8b2e-82f2355e32f1
+
+
 
 ### 本地 Demo
 
