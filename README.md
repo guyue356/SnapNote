@@ -1,5 +1,3 @@
-
-https://github.com/user-attachments/assets/fc575fcf-7d6e-4e3b-b2ed-a765126b5be3
 <div align="center">
 
 <img src="./docs/images/snapnote-cover.png" alt="SnapNote：把视频变成可复习的图文笔记" width="100%" />
