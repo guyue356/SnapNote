@@ -12,8 +12,8 @@ python-dotenv>=1.0
 Pillow>=10.0
 ImageHash>=4.3
 numpy>=1.26
-# Optional semantic retrieval runtime. The model itself is downloaded lazily.
-# sentence-transformers>=5.1
+# Local semantic retrieval runtime. The model snapshot is downloaded separately.
+sentence-transformers>=5.1
 # Required by the default, real local ASR pipeline:
 faster-whisper>=1.1
 # Optional heavyweight OCR provider:

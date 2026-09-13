@@ -87,8 +87,8 @@ export default function ResultPage() {
               time: section.start_time,
               end: section.end_time,
               keyframeTime: keyframe?.timestamp ?? section.start_time,
-              title: section.stage,
-              summary: section.description,
+              title: section.title || section.summary || section.description || section.stage || "未命名章节",
+              summary: section.summary || section.description || "",
               imageUrl: backendAsset(keyframe?.image_url || ""),
             };
           }));
@@ -130,7 +130,7 @@ export default function ResultPage() {
     return () => window.clearInterval(timer);
   }, [knowledgeStatus?.status, params.id]);
 
-  useEffect(() => () => tickerRef.current && window.clearInterval(tickerRef.current), []);
+  useEffect(() => () => { if (tickerRef.current) window.clearInterval(tickerRef.current); }, []);
 
   const applyInitialSeek = useCallback((video?: HTMLVideoElement) => {
     const requested = initialSeekRef.current;
@@ -339,7 +339,11 @@ export default function ResultPage() {
                 <em>已完成</em>
               </div>
               <p className="asset-facts">{formatDuration(task.duration)} · {chapters.length} 个章节 · {visualAnalysis.provider || "多模态流水线"}</p>
+              {(visualAnalysis.content_summary || visualAnalysis.summary) && (
+                <p className="asset-overview">{visualAnalysis.content_summary || visualAnalysis.summary}</p>
+              )}
               <div className="asset-actions">
+                <button className="assistant-quick-action" type="button" onClick={() => router.push(`/assistant?asset=${task.id}`)}>✦ 问问这段视频</button>
                 <button className="secondary-button" type="button" onClick={regenerate}>↻ 重新生成</button>
                 <button className="dark-button" type="button" onClick={() => hasBackend ? window.location.assign(`${API_BASE}/api/snapnote/tasks/${task.id}/export/markdown`) : exportMarkdown(task)}>↓ 导出 Markdown</button>
                 <button className="danger-button" type="button" onClick={deleteSourceAsset} disabled={knowledgeBusy}>删除视频</button>

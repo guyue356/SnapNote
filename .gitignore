@@ -25,16 +25,23 @@ htmlcov/
 # retaining the repository's existing local-test convention.
 !backend/tests/
 backend/tests/*
+!backend/tests/test_assistant.py
 !backend/tests/test_knowledge.py
+!backend/tests/test_vision.py
+!backend/tests/test_pipeline_progress.py
 
 # Runtime data
 storage/app.db
 storage/tasks/
+storage/models/
 *.log
 .snapnote-pids.json
 .snapnote-setup.json
 
 # System / editor
+# Local promotional video assets and workspace
+/video-craft/
+
 .DS_Store
 Thumbs.db
 .vscode/

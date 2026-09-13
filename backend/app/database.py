@@ -69,6 +69,7 @@ class SnapTask(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     filename: Mapped[str] = mapped_column(String(500))
+    generated_title: Mapped[str | None] = mapped_column(String(500), nullable=True)
     video_path: Mapped[str] = mapped_column(Text)
     audio_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     duration: Mapped[float] = mapped_column(Float, default=0)
@@ -292,6 +293,65 @@ class KnowledgeBuildRun(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class AssistantConversation(Base):
+    __tablename__ = "assistant_conversations"
+    __table_args__ = (Index("ix_assistant_conversation_owner_updated", "owner_scope", "updated_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    owner_scope: Mapped[str] = mapped_column(String(100), default="local", index=True)
+    title: Mapped[str] = mapped_column(String(200), default="新会话")
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    default_scope_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class AssistantMessage(Base):
+    __tablename__ = "assistant_messages"
+    __table_args__ = (
+        Index("ix_assistant_message_conversation_created", "conversation_id", "created_at"),
+        UniqueConstraint("conversation_id", "client_request_id", name="uq_assistant_message_request"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("assistant_conversations.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[str] = mapped_column(String(20))
+    intent: Mapped[str] = mapped_column(String(30), default="knowledge_qa")
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    content: Mapped[str] = mapped_column(Text, default="")
+    client_request_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    scope_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
+    retrieval_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
+    error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AssistantCitation(Base):
+    __tablename__ = "assistant_citations"
+    __table_args__ = (
+        UniqueConstraint("message_id", "ordinal", name="uq_assistant_citation_ordinal"),
+        Index("ix_assistant_citation_message", "message_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    message_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("assistant_messages.id", ondelete="CASCADE"), index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer)
+    asset_id: Mapped[str] = mapped_column(String(36), index=True)
+    task_id: Mapped[str] = mapped_column(String(36), index=True)
+    asset_version_id: Mapped[str] = mapped_column(String(36))
+    chunk_id: Mapped[str] = mapped_column(String(36))
+    chapter_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    start_time: Mapped[float | None] = mapped_column(Float, nullable=True)
+    end_time: Mapped[float | None] = mapped_column(Float, nullable=True)
+    text_snapshot: Mapped[str] = mapped_column(Text, default="")
+    media_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    availability: Mapped[str] = mapped_column(String(20), default="available")
+
+
 engine = create_async_engine(DATABASE_URL)
 async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
@@ -322,6 +382,10 @@ async def init_db():
                     await connection.execute(text("PRAGMA table_info(snap_tasks)"))
                 ).mappings().all()
                 existing = {row["name"] for row in columns}
+                if "generated_title" not in existing:
+                    await connection.execute(text(
+                        "ALTER TABLE snap_tasks ADD COLUMN generated_title VARCHAR(500)"
+                    ))
                 if "visual_analysis_json" not in existing:
                     await connection.execute(text(
                         "ALTER TABLE snap_tasks ADD COLUMN visual_analysis_json "
@@ -338,6 +402,10 @@ async def init_db():
                         "VARCHAR(20) NOT NULL DEFAULT 'mimo'"
                     ))
         await connection.run_sync(Base.metadata.create_all)
+        if DATABASE_URL.startswith("postgresql"):
+            await connection.execute(text(
+                "ALTER TABLE snap_tasks ADD COLUMN IF NOT EXISTS generated_title VARCHAR(500)"
+            ))
         applied = (await connection.execute(text(
             "SELECT version FROM schema_migrations WHERE version = 1"
         ))).first()
@@ -355,4 +423,22 @@ async def init_db():
                 text("INSERT INTO schema_migrations(version, name, applied_at) "
                      "VALUES (2, :name, :applied_at)"),
                 {"name": "knowledge_embedding_index_v1", "applied_at": utcnow()},
+            )
+        assistant_migration = (await connection.execute(text(
+            "SELECT version FROM schema_migrations WHERE version = 3"
+        ))).first()
+        if not assistant_migration:
+            await connection.execute(
+                text("INSERT INTO schema_migrations(version, name, applied_at) "
+                     "VALUES (3, :name, :applied_at)"),
+                {"name": "assistant_conversations_v1", "applied_at": utcnow()},
+            )
+        title_migration = (await connection.execute(text(
+            "SELECT version FROM schema_migrations WHERE version = 4"
+        ))).first()
+        if not title_migration:
+            await connection.execute(
+                text("INSERT INTO schema_migrations(version, name, applied_at) "
+                     "VALUES (4, :name, :applied_at)"),
+                {"name": "generated_video_title_v1", "applied_at": utcnow()},
             )

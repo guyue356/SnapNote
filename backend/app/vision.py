@@ -9,11 +9,15 @@ from .config import (
     FFMPEG_BIN,
     FRAME_ANALYSIS_FPS,
     FRAME_ANALYSIS_WIDTH,
+    FRAME_MAX_GAP_SECONDS,
     FRAME_DYNAMIC_THRESHOLD,
     FRAME_FALLBACK_INTERVAL_SECONDS,
     FRAME_MAX_COUNT,
     FRAME_OUTPUT_WIDTH,
     FRAME_PHASH_THRESHOLD,
+    FRAME_SEMANTIC_MAX_SECONDS,
+    FRAME_SEMANTIC_MIN_SECONDS,
+    FRAME_TARGET_INTERVAL_SECONDS,
     MIMO_VISION_CLIP_SECONDS,
     SCENE_CHANGE_THRESHOLD,
     SCENE_MAX_DURATION_SECONDS,
@@ -129,7 +133,7 @@ def _scan_video_sync(video_path: str, duration: float) -> list[dict]:
 def _shots_from_samples(samples: list[dict], duration: float) -> list[dict]:
     if not samples:
         return []
-    boundaries = [0]
+    boundaries = [(0, "start")]
     last_boundary_time = samples[0]["timestamp"]
     for index, sample in enumerate(samples[1:], start=1):
         elapsed = sample["timestamp"] - last_boundary_time
@@ -139,12 +143,16 @@ def _shots_from_samples(samples: list[dict], duration: float) -> list[dict]:
         )
         forced = elapsed >= SCENE_MAX_DURATION_SECONDS
         if changed or forced:
-            boundaries.append(index)
+            boundaries.append((index, "scene_change" if changed else "max_duration"))
             last_boundary_time = sample["timestamp"]
-    boundaries.append(len(samples))
+    boundaries.append((len(samples), "end"))
 
     shots = []
-    for shot_index, (left, right) in enumerate(zip(boundaries, boundaries[1:]), start=1):
+    for shot_index, (left_boundary, right_boundary) in enumerate(
+        zip(boundaries, boundaries[1:]), start=1
+    ):
+        left, boundary_reason = left_boundary
+        right, end_reason = right_boundary
         group = samples[left:right]
         if not group:
             continue
@@ -161,6 +169,8 @@ def _shots_from_samples(samples: list[dict], duration: float) -> list[dict]:
         shots.append({
             **representative,
             "shot_id": f"shot-{shot_index}",
+            "boundary_reason": boundary_reason,
+            "end_reason": end_reason,
             "start_time": round(start, 3),
             "end_time": round(max(start + 0.1, end), 3),
             "duration": round(max(0.1, end - start), 3),
@@ -226,15 +236,14 @@ async def analyze_shots(video_path: str, duration: float) -> tuple[list[dict], d
     try:
         samples = await asyncio.to_thread(_scan_video_sync, video_path, duration)
         detected = _shots_from_samples(samples, duration)
-        shots = _cap_shots(detected, duration)
-        if not shots:
+        if not detected:
             raise RuntimeError("scene scan produced no usable shots")
-        return shots, {
+        return detected, {
             "engine": "ffmpeg-rawvideo+numpy",
             "sample_fps": FRAME_ANALYSIS_FPS,
             "sample_count": len(samples),
             "detected_shots": len(detected),
-            "selected_shots": len(shots),
+            "candidate_shots": len(detected),
             "fallback": False,
         }
     except Exception as error:
@@ -243,20 +252,320 @@ async def analyze_shots(video_path: str, duration: float) -> tuple[list[dict], d
             "engine": "fixed-interval-fallback",
             "sample_count": 0,
             "detected_shots": len(shots),
-            "selected_shots": len(shots),
+            "candidate_shots": len(shots),
             "fallback": True,
             "warning": str(error)[:500],
         }
+
+
+def build_semantic_units(
+    segments: list[dict], shots: list[dict], duration: float
+) -> list[dict]:
+    """Build small time-grounded content units from ASR and real scene changes.
+
+    ASR provider chunks are transport boundaries, not chapters.  Real scene
+    changes refine those coarse ranges, while a maximum duration guarantees
+    that speech-heavy or static videos still receive regular visual coverage.
+    """
+    duration = max(0.1, float(duration))
+    minimum = max(5.0, float(FRAME_SEMANTIC_MIN_SECONDS))
+    maximum = max(minimum, float(FRAME_SEMANTIC_MAX_SECONDS))
+    proposed: list[tuple[float, str]] = [(0.0, "start"), (duration, "end")]
+    for segment in segments:
+        for key in ("start", "end"):
+            try:
+                value = max(0.0, min(duration, float(segment.get(key, 0))))
+            except (TypeError, ValueError):
+                continue
+            if 0 < value < duration:
+                proposed.append((value, "transcript"))
+    for shot in shots:
+        if shot.get("boundary_reason") != "scene_change":
+            continue
+        try:
+            value = max(0.0, min(duration, float(shot.get("start_time", 0))))
+        except (TypeError, ValueError):
+            continue
+        if 0 < value < duration:
+            proposed.append((value, "scene_change"))
+
+    priority = {"start": 4, "end": 4, "scene_change": 3, "transcript": 2}
+    ordered = sorted(proposed, key=lambda item: (item[0], -priority[item[1]]))
+    boundaries: list[tuple[float, str]] = []
+    for value, reason in ordered:
+        if boundaries and abs(value - boundaries[-1][0]) < minimum:
+            if priority[reason] > priority[boundaries[-1][1]] and value < duration:
+                boundaries[-1] = (value, reason)
+            continue
+        boundaries.append((value, reason))
+    if not boundaries or boundaries[0][0] > 0:
+        boundaries.insert(0, (0.0, "start"))
+    if boundaries[-1][0] < duration:
+        boundaries.append((duration, "end"))
+    elif boundaries[-1][0] > duration:
+        boundaries[-1] = (duration, "end")
+
+    expanded: list[tuple[float, str]] = [boundaries[0]]
+    for value, reason in boundaries[1:]:
+        previous = expanded[-1][0]
+        gap = value - previous
+        parts = max(1, math.ceil(gap / maximum))
+        for index in range(1, parts):
+            expanded.append((previous + gap * index / parts, "coverage_split"))
+        expanded.append((value, reason))
+    if len(expanded) > 2 and duration - expanded[-2][0] < minimum:
+        expanded.pop(-2)
+
+    units = []
+    for index, ((start, reason), (end, end_reason)) in enumerate(
+        zip(expanded, expanded[1:]), start=1
+    ):
+        related = []
+        segment_indices = []
+        for segment_index, segment in enumerate(segments):
+            try:
+                segment_start = float(segment.get("start", 0))
+                segment_end = float(segment.get("end", segment_start))
+            except (TypeError, ValueError):
+                continue
+            if segment_end > start and segment_start < end:
+                text = str(segment.get("text", "")).strip()
+                if text:
+                    related.append(text)
+                segment_indices.append(segment_index)
+        units.append({
+            "id": f"unit-{index}",
+            "start_time": round(start, 3),
+            "end_time": round(max(start + 0.1, end), 3),
+            "boundary_reason": reason,
+            "end_reason": end_reason,
+            "transcript_text": " ".join(related)[:4000],
+            "segment_indices": segment_indices,
+        })
+    return units
+
+
+def _unit_for_timestamp(units: list[dict], timestamp: float) -> dict | None:
+    for index, unit in enumerate(units):
+        start = float(unit["start_time"])
+        end = float(unit["end_time"])
+        if start <= timestamp < end or (index == len(units) - 1 and timestamp <= end):
+            return unit
+    return None
+
+
+def _shot_score(shot: dict, unit: dict) -> float:
+    start, end = float(unit["start_time"]), float(unit["end_time"])
+    midpoint = (start + end) / 2
+    radius = max(0.1, (end - start) / 2)
+    proximity = max(0.0, 1 - abs(float(shot["timestamp"]) - midpoint) / radius)
+    return (
+        float(shot.get("quality_score", 0.5))
+        + proximity * 0.16
+        + float(shot.get("stability_score", 0.5)) * 0.05
+        - float(shot.get("transition_score", 0)) * 0.05
+    )
+
+
+def _coverage_placeholder(unit: dict, reason: str = "semantic_anchor") -> dict:
+    start, end = float(unit["start_time"]), float(unit["end_time"])
+    timestamp = min(end - 0.05, start + max(0.2, min(1.0, (end - start) / 3)))
+    return {
+        "shot_id": f"coverage-{unit['id']}",
+        "timestamp": round(max(0.0, timestamp), 3),
+        "start_time": round(start, 3),
+        "end_time": round(end, 3),
+        "duration": round(max(0.1, end - start), 3),
+        "sharpness_score": 0.5,
+        "brightness_score": 0.5,
+        "contrast_score": 0.5,
+        "stability_score": 0.5,
+        "motion_score": 0.0,
+        "transition_score": 0.0,
+        "quality_score": 0.5,
+        "dynamic_score": 0.0,
+        "is_dynamic": False,
+        "sample_count": 0,
+        "boundary_reason": "coverage_repair",
+        "selection_reason": reason,
+        "semantic_unit_id": unit["id"],
+        "coverage_anchor": True,
+    }
+
+
+def _annotate_shot(shot: dict, unit: dict, reason: str, anchor: bool) -> dict:
+    return {
+        **shot,
+        "semantic_unit_id": unit["id"],
+        "selection_reason": reason,
+        "coverage_anchor": anchor,
+    }
+
+
+def _maximum_gap(timestamps: list[float], duration: float) -> float:
+    timeline = [0.0, *sorted(max(0.0, min(duration, item)) for item in timestamps), duration]
+    return max((right - left for left, right in zip(timeline, timeline[1:])), default=duration)
+
+
+def select_shots_for_semantic_coverage(
+    shots: list[dict], units: list[dict], duration: float
+) -> tuple[list[dict], dict]:
+    maximum = max(1, int(FRAME_MAX_COUNT))
+    if len(units) <= maximum:
+        anchor_units = units
+    elif maximum == 1:
+        anchor_units = [units[len(units) // 2]]
+    else:
+        indexes = {
+            round(index * (len(units) - 1) / (maximum - 1))
+            for index in range(maximum)
+        }
+        anchor_units = [units[index] for index in sorted(indexes)]
+
+    selected: list[dict] = []
+    selected_ids: set[str] = set()
+    for unit in anchor_units:
+        candidates = [
+            shot for shot in shots
+            if float(unit["start_time"]) <= float(shot["timestamp"]) < float(unit["end_time"])
+            and str(shot.get("shot_id")) not in selected_ids
+        ]
+        if candidates:
+            winner = max(candidates, key=lambda shot: _shot_score(shot, unit))
+            selected.append(_annotate_shot(winner, unit, "semantic_anchor", True))
+            selected_ids.add(str(winner.get("shot_id")))
+        else:
+            placeholder = _coverage_placeholder(unit)
+            selected.append(placeholder)
+            selected_ids.add(str(placeholder["shot_id"]))
+
+    target_interval = max(10.0, float(FRAME_TARGET_INTERVAL_SECONDS))
+    target_count = min(maximum, max(len(selected), math.ceil(duration / target_interval)))
+    max_gap = max(target_interval, float(FRAME_MAX_GAP_SECONDS))
+    remaining = [shot for shot in shots if str(shot.get("shot_id")) not in selected_ids]
+    while remaining and len(selected) < maximum:
+        timestamps = [float(shot["timestamp"]) for shot in selected]
+        current_gap = _maximum_gap(timestamps, duration)
+        if len(selected) >= target_count and current_gap <= max_gap:
+            break
+        winner = max(
+            remaining,
+            key=lambda shot: (
+                min(
+                    [abs(float(shot["timestamp"]) - value) for value in timestamps]
+                    + [float(shot["timestamp"]), duration - float(shot["timestamp"])]
+                ),
+                float(shot.get("quality_score", 0.5)),
+            ),
+        )
+        unit = _unit_for_timestamp(units, float(winner["timestamp"])) or units[-1]
+        selected.append(_annotate_shot(winner, unit, "coverage_fill", False))
+        selected_ids.add(str(winner.get("shot_id")))
+        remaining.remove(winner)
+
+    selected.sort(key=lambda shot: float(shot["timestamp"]))
+    stats = audit_frame_coverage(selected, units, duration)
+    stats.update({
+        "candidate_shots": len(shots),
+        "selected_shots": len(selected),
+        "frame_budget": maximum,
+        "target_interval_seconds": target_interval,
+    })
+    return selected, stats
+
+
+def audit_frame_coverage(
+    frames: list[dict], units: list[dict], duration: float
+) -> dict:
+    covered = set()
+    for frame in frames:
+        unit_id = frame.get("semantic_unit_id")
+        if unit_id:
+            covered.add(str(unit_id))
+            continue
+        unit = _unit_for_timestamp(units, float(frame.get("timestamp", 0)))
+        if unit:
+            covered.add(str(unit["id"]))
+    unit_ids = {str(unit["id"]) for unit in units}
+    uncovered = sorted(unit_ids - covered)
+    timestamps = [float(frame.get("timestamp", 0)) for frame in frames]
+    return {
+        "semantic_unit_count": len(units),
+        "covered_semantic_units": len(unit_ids & covered),
+        "semantic_coverage_ratio": round(len(unit_ids & covered) / max(1, len(unit_ids)), 4),
+        "uncovered_semantic_unit_ids": uncovered,
+        "max_frame_gap_seconds": round(_maximum_gap(timestamps, float(duration)), 3),
+    }
+
+
+def select_coverage_repairs(
+    frames: list[dict],
+    shots: list[dict],
+    units: list[dict],
+    duration: float,
+    attempted_shot_ids: set[str] | None = None,
+) -> list[dict]:
+    """Choose alternate or synthetic shots for units/gaps left after extraction."""
+    attempted = set(attempted_shot_ids or set())
+    existing_ids = {str(frame.get("shot_id")) for frame in frames}
+    unavailable = attempted | existing_ids
+    repairs: list[dict] = []
+    audit = audit_frame_coverage(frames, units, duration)
+    uncovered = set(audit["uncovered_semantic_unit_ids"])
+    by_id = {str(unit["id"]): unit for unit in units}
+    for unit_id in sorted(uncovered):
+        unit = by_id[unit_id]
+        candidates = [
+            shot for shot in shots
+            if str(shot.get("shot_id")) not in unavailable
+            and float(unit["start_time"]) <= float(shot["timestamp"]) < float(unit["end_time"])
+        ]
+        if candidates:
+            winner = max(candidates, key=lambda shot: _shot_score(shot, unit))
+            repair = _annotate_shot(winner, unit, "uncovered_unit_repair", True)
+        else:
+            repair = _coverage_placeholder(unit, "uncovered_unit_repair")
+        if str(repair["shot_id"]) not in unavailable:
+            repairs.append(repair)
+            unavailable.add(str(repair["shot_id"]))
+
+    max_gap = max(10.0, float(FRAME_MAX_GAP_SECONDS))
+    timeline = [(0.0, None), *sorted(
+        (float(frame.get("timestamp", 0)), frame) for frame in [*frames, *repairs]
+    ), (float(duration), None)]
+    for (left, _), (right, _) in zip(timeline, timeline[1:]):
+        if right - left <= max_gap:
+            continue
+        midpoint = (left + right) / 2
+        candidates = [
+            shot for shot in shots
+            if str(shot.get("shot_id")) not in unavailable
+            and left < float(shot["timestamp"]) < right
+        ]
+        if candidates:
+            winner = min(candidates, key=lambda shot: abs(float(shot["timestamp"]) - midpoint))
+            unit = _unit_for_timestamp(units, float(winner["timestamp"])) or units[-1]
+            repair = _annotate_shot(winner, unit, "temporal_gap_repair", False)
+        else:
+            unit = _unit_for_timestamp(units, midpoint) or units[-1]
+            repair = _coverage_placeholder(unit, "temporal_gap_repair")
+            repair["shot_id"] = f"coverage-gap-{midpoint:.3f}"
+            repair["timestamp"] = round(midpoint, 3)
+        if str(repair["shot_id"]) not in unavailable:
+            repairs.append(repair)
+            unavailable.add(str(repair["shot_id"]))
+    return repairs[:max(0, int(FRAME_MAX_COUNT) - len(frames))]
 
 
 async def extract_keyframes(
     video_path: str,
     shots: list[dict],
     frames_dir: Path,
+    start_index: int = 1,
 ) -> list[dict]:
     frames_dir.mkdir(parents=True, exist_ok=True)
     frames = []
-    for index, shot in enumerate(shots, start=1):
+    for index, shot in enumerate(shots, start=start_index):
         output = frames_dir / f"frame_{index:03d}.jpg"
         command = [
             FFMPEG_BIN,
@@ -305,8 +614,19 @@ def deduplicate_frames(frames: list[dict], frames_dir: Path) -> list[dict]:
             path = frames_dir / Path(frame["image_url"]).name
             with Image.open(path) as image:
                 current = imagehash.phash(image)
-            if hashes and min(current - previous for previous in hashes) <= FRAME_PHASH_THRESHOLD:
-                continue
+            if not frame.get("coverage_anchor"):
+                unit_id = frame.get("semantic_unit_id")
+                comparable = [
+                    previous_hash
+                    for previous_frame, previous_hash in zip(selected, hashes)
+                    if (
+                        unit_id and previous_frame.get("semantic_unit_id") == unit_id
+                    ) or (
+                        not unit_id and previous_frame is selected[-1]
+                    )
+                ]
+                if comparable and min(current - previous for previous in comparable) <= FRAME_PHASH_THRESHOLD:
+                    continue
             hashes.append(current)
             selected.append(frame)
         return selected

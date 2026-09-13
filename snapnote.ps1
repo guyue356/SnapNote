@@ -52,6 +52,22 @@ function Test-HttpEndpoint {
     }
 }
 
+function Add-LoopbackProxyBypass {
+    # Child processes and the browser launched below inherit these values.
+    # Preserve any existing bypass list while ensuring local API traffic never
+    # goes through HTTP_PROXY/HTTPS_PROXY.
+    $entries = @(
+        @($env:NO_PROXY -split ',')
+        @($env:no_proxy -split ',')
+        '127.0.0.1'
+        'localhost'
+        '::1'
+    ) | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique
+    $value = $entries -join ','
+    $env:NO_PROXY = $value
+    $env:no_proxy = $value
+}
+
 function Assert-PortAvailable {
     param(
         [Parameter(Mandatory = $true)][int]$Port,
@@ -328,6 +344,7 @@ function Invoke-Start {
 
     Write-Host "正在启动 SnapNote…" -ForegroundColor Cyan
     Normalize-ProcessPathVariable
+    Add-LoopbackProxyBypass
     $backendProcess = Start-Process -FilePath $pythonPath -ArgumentList @("-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "$ApiPort", "--reload") -WorkingDirectory $backendPath -WindowStyle Hidden -PassThru -RedirectStandardOutput $backendOutLog -RedirectStandardError $backendErrorLog
     $quotedFrontendCli = '"' + $frontendCli + '"'
     $frontendProcess = Start-Process -FilePath $nodeCommand.Source -ArgumentList @($quotedFrontendCli, "dev", "--host", "127.0.0.1", "--port", "$WebPort") -WorkingDirectory $frontendPath -WindowStyle Hidden -PassThru -RedirectStandardOutput $frontendOutLog -RedirectStandardError $frontendErrorLog

@@ -16,6 +16,7 @@ from sse_starlette.sse import EventSourceResponse
 from .config import (
     DEFAULT_ASR_PROVIDER,
     DEFAULT_NOTE_MODEL,
+    ENABLE_ASSISTANT,
     ENABLE_KNOWLEDGE_REBUILD,
     ENABLE_KNOWLEDGE_SEARCH,
     ENABLE_KNOWLEDGE_STATUS_UI,
@@ -25,6 +26,20 @@ from .config import (
     TASKS_DIR,
 )
 from .database import KnowledgeAsset, SnapTask, async_session, init_db
+from .assistant import (
+    AssistantError,
+    archive_conversation,
+    cancel_message,
+    create_conversation,
+    delete_conversation,
+    get_messages,
+    list_conversations,
+    message_stream,
+    recover_interrupted_messages,
+    restore_conversation,
+    scope_assets,
+    update_scope,
+)
 from .knowledge import (
     KnowledgeError,
     build_knowledge_asset,
@@ -40,13 +55,21 @@ from .knowledge import (
 )
 from .embedding import EmbeddingUnavailable
 from .pipeline import new_processing_state, reset_task, run_pipeline
-from .schemas import KnowledgeSearchRequest, RetryRequest, TaskCreated
+from .schemas import (
+    AssistantConversationCreate,
+    AssistantMessageCreate,
+    AssistantScopeUpdate,
+    KnowledgeSearchRequest,
+    RetryRequest,
+    TaskCreated,
+)
 from .sse_manager import sse_manager
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await init_db()
+    await recover_interrupted_messages()
     yield
 
 
@@ -71,15 +94,22 @@ def _json_payload(raw: str | None, fallback):
 def _task_payload(task: SnapTask, knowledge_asset: dict | None = None):
     frames = _json_payload(task.frames_json, [])
     processing_state = _json_payload(task.processing_state_json, {})
+    visual_analysis = _json_payload(task.visual_analysis_json, {})
+    generated_title = (
+        (task.generated_title or "").strip()
+        or str(visual_analysis.get("video_title") or "").strip()
+        or Path(task.filename).stem
+    )
     return {
-        "id": task.id, "filename": task.filename, "title": Path(task.filename).stem,
+        "id": task.id, "filename": task.filename, "title": generated_title,
+        "generated_title": task.generated_title,
         "duration": task.duration, "status": task.status, "current_stage": task.current_stage,
         "progress": task.progress, "asr_provider": task.asr_provider, "note_style": task.note_style,
         "note_model": task.note_model,
         "error_message": task.error_message, "frame_count": len(frames), "frames": frames,
         "transcript_segments": _json_payload(task.transcripts_json, []),
         "note_blocks": _json_payload(task.notes_json, []), "final_markdown": task.final_markdown,
-        "visual_analysis": _json_payload(task.visual_analysis_json, {}),
+        "visual_analysis": visual_analysis,
         "processing_state": processing_state,
         "video_url": f"/api/snapnote/tasks/{task.id}/video", "created_at": task.created_at,
         "knowledge_asset": knowledge_asset if ENABLE_KNOWLEDGE_STATUS_UI else None,
@@ -226,6 +256,128 @@ async def knowledge_search(payload: KnowledgeSearchRequest):
         )
     except KnowledgeError as error:
         raise HTTPException(422, {"code": error.code, "summary": error.summary}) from None
+
+
+@app.post("/api/assistant/conversations")
+async def assistant_create_conversation(payload: AssistantConversationCreate):
+    if not ENABLE_ASSISTANT:
+        raise HTTPException(503, "知识助手当前未启用")
+    try:
+        return await create_conversation(payload.owner_scope, payload.default_scope.model_dump())
+    except AssistantError as error:
+        raise HTTPException(422, {"code": error.code, "summary": error.message}) from None
+
+
+@app.get("/api/assistant/conversations")
+async def assistant_list_conversations(owner_scope: str = "local", status: str = "active"):
+    if not ENABLE_ASSISTANT:
+        raise HTTPException(503, "知识助手当前未启用")
+    try:
+        return await list_conversations(owner_scope, status)
+    except AssistantError as error:
+        raise HTTPException(422, {"code": error.code, "summary": error.message}) from None
+
+
+def _conversation_error_status(error: AssistantError) -> int:
+    if error.code == "CONVERSATION_NOT_FOUND":
+        return 404
+    if error.code in {"CONVERSATION_BUSY", "CONVERSATION_NOT_ARCHIVED"}:
+        return 409
+    return 422
+
+
+@app.post("/api/assistant/conversations/{conversation_id}/archive")
+async def assistant_archive_conversation(conversation_id: str, owner_scope: str = "local"):
+    if not ENABLE_ASSISTANT:
+        raise HTTPException(503, "知识助手当前未启用")
+    try:
+        return await archive_conversation(conversation_id, owner_scope)
+    except AssistantError as error:
+        raise HTTPException(_conversation_error_status(error), {"code": error.code, "summary": error.message}) from None
+
+
+@app.post("/api/assistant/conversations/{conversation_id}/restore")
+async def assistant_restore_conversation(conversation_id: str, owner_scope: str = "local"):
+    if not ENABLE_ASSISTANT:
+        raise HTTPException(503, "知识助手当前未启用")
+    try:
+        return await restore_conversation(conversation_id, owner_scope)
+    except AssistantError as error:
+        raise HTTPException(_conversation_error_status(error), {"code": error.code, "summary": error.message}) from None
+
+
+@app.delete("/api/assistant/conversations/{conversation_id}")
+async def assistant_delete_conversation(conversation_id: str, owner_scope: str = "local"):
+    if not ENABLE_ASSISTANT:
+        raise HTTPException(503, "知识助手当前未启用")
+    try:
+        return await delete_conversation(conversation_id, owner_scope)
+    except AssistantError as error:
+        raise HTTPException(_conversation_error_status(error), {"code": error.code, "summary": error.message}) from None
+
+
+@app.get("/api/assistant/scope/assets")
+async def assistant_scope_assets(
+    asset_ids: str | None = None,
+    content_types: str | None = None,
+    created_after: str | None = None,
+    created_before: str | None = None,
+    owner_scope: str = "local",
+):
+    if not ENABLE_ASSISTANT:
+        raise HTTPException(503, "知识助手当前未启用")
+    scope = {
+        "asset_ids": [item for item in (asset_ids or "").split(",") if item] if asset_ids is not None else None,
+        "content_types": [item for item in (content_types or "").split(",") if item] if content_types is not None else None,
+        "created_after": created_after, "created_before": created_before,
+    }
+    try:
+        return await scope_assets(scope, owner_scope)
+    except AssistantError as error:
+        raise HTTPException(422, {"code": error.code, "summary": error.message}) from None
+
+
+@app.patch("/api/assistant/conversations/{conversation_id}/scope")
+async def assistant_update_scope(conversation_id: str, payload: AssistantScopeUpdate, owner_scope: str = "local"):
+    if not ENABLE_ASSISTANT:
+        raise HTTPException(503, "知识助手当前未启用")
+    try:
+        return await update_scope(conversation_id, payload.scope.model_dump(), owner_scope)
+    except AssistantError as error:
+        raise HTTPException(404 if error.code == "CONVERSATION_NOT_FOUND" else 422, {"code": error.code, "summary": error.message}) from None
+
+
+@app.get("/api/assistant/conversations/{conversation_id}/messages")
+async def assistant_messages(conversation_id: str, owner_scope: str = "local"):
+    if not ENABLE_ASSISTANT:
+        raise HTTPException(503, "知识助手当前未启用")
+    try:
+        return await get_messages(conversation_id, owner_scope)
+    except AssistantError as error:
+        raise HTTPException(404, {"code": error.code, "summary": error.message}) from None
+
+
+@app.post("/api/assistant/conversations/{conversation_id}/messages")
+async def assistant_send_message(conversation_id: str, payload: AssistantMessageCreate, owner_scope: str = "local"):
+    if not ENABLE_ASSISTANT:
+        raise HTTPException(503, "知识助手当前未启用")
+    try:
+        events = message_stream(conversation_id, payload.model_dump(), owner_scope)
+        async def stream():
+            async for item in events:
+                yield {"event": item["event"], "data": json.dumps(item["data"], ensure_ascii=False)}
+        return EventSourceResponse(stream())
+    except AssistantError as error:
+        raise HTTPException(422, {"code": error.code, "summary": error.message}) from None
+
+
+@app.post("/api/assistant/messages/{message_id}/cancel")
+async def assistant_cancel_message(message_id: str, owner_scope: str = "local"):
+    if not ENABLE_ASSISTANT:
+        raise HTTPException(503, "知识助手当前未启用")
+    if not await cancel_message(message_id, owner_scope):
+        raise HTTPException(404, "消息不存在或不可访问")
+    return {"ok": True, "status": "cancelled"}
 
 
 @app.post("/api/knowledge/assets/{asset_id}/embeddings/rebuild")

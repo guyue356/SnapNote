@@ -29,23 +29,55 @@ ENABLE_KNOWLEDGE_STATUS_UI = _flag("ENABLE_KNOWLEDGE_STATUS_UI")
 ENABLE_KNOWLEDGE_REBUILD = _flag("ENABLE_KNOWLEDGE_REBUILD")
 KNOWLEDGE_OWNER_SCOPE = os.getenv("KNOWLEDGE_OWNER_SCOPE", "local").strip() or "local"
 
+# The assistant is deliberately isolated from the existing video pipeline.  It
+# can be enabled independently and still offers local asset search without an
+# LLM key.
+ENABLE_ASSISTANT = _flag("ENABLE_ASSISTANT", "1")
+ASSISTANT_PROVIDER = os.getenv("ASSISTANT_PROVIDER", "deepseek").strip().lower()
+ASSISTANT_MODEL = os.getenv("ASSISTANT_MODEL", "deepseek-chat").strip()
+ASSISTANT_TOP_K = int(os.getenv("ASSISTANT_TOP_K", "8"))
+ASSISTANT_MAX_CONTEXT_CHARS = int(os.getenv("ASSISTANT_MAX_CONTEXT_CHARS", "24000"))
+ASSISTANT_MAX_ANSWER_TOKENS = int(os.getenv("ASSISTANT_MAX_ANSWER_TOKENS", "1200"))
+ASSISTANT_TIMEOUT_SECONDS = int(os.getenv("ASSISTANT_TIMEOUT_SECONDS", "90"))
+ASSISTANT_MAX_HISTORY_MESSAGES = int(os.getenv("ASSISTANT_MAX_HISTORY_MESSAGES", "12"))
+ASSISTANT_MAX_ASSET_RESULTS = int(os.getenv("ASSISTANT_MAX_ASSET_RESULTS", "20"))
+ASSISTANT_MIN_EVIDENCE_SCORE = float(os.getenv("ASSISTANT_MIN_EVIDENCE_SCORE", "0.45"))
+
 # Semantic retrieval is deliberately optional.  The relational knowledge model
 # and keyword search remain the fallback so the local SQLite demo still works
 # without downloading a model or running PostgreSQL.
-ENABLE_KNOWLEDGE_EMBEDDINGS = _flag("ENABLE_KNOWLEDGE_EMBEDDINGS", "0")
+ENABLE_KNOWLEDGE_EMBEDDINGS = _flag("ENABLE_KNOWLEDGE_EMBEDDINGS", "1")
 ENABLE_KNOWLEDGE_SEMANTIC_SEARCH = _flag("ENABLE_KNOWLEDGE_SEMANTIC_SEARCH", "1")
 EMBEDDING_MODEL_NAME = os.getenv(
     "EMBEDDING_MODEL_NAME", "Qwen/Qwen3-Embedding-0.6B"
 ).strip()
+_embedding_model_path = os.getenv("EMBEDDING_MODEL_PATH", "").strip()
+_embedding_model_candidate = Path(_embedding_model_path).expanduser() if _embedding_model_path else None
+EMBEDDING_MODEL_PATH = (
+    (
+        _embedding_model_candidate
+        if _embedding_model_candidate.is_absolute()
+        else BACKEND_DIR / _embedding_model_candidate
+    ).resolve()
+    if _embedding_model_candidate
+    else (STORAGE_ROOT / "models" / "Qwen3-Embedding-0.6B").resolve()
+)
+EMBEDDING_LOCAL_FILES_ONLY = _flag("EMBEDDING_LOCAL_FILES_ONLY", "1")
 EMBEDDING_MODEL_VERSION = os.getenv("EMBEDDING_MODEL_VERSION", "default").strip() or "default"
 EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "16"))
 EMBEDDING_DEVICE = os.getenv("EMBEDDING_DEVICE", "auto").strip().lower() or "auto"
 SEMANTIC_RECALL_K = int(os.getenv("SEMANTIC_RECALL_K", "60"))
+SEMANTIC_QUERY_TIMEOUT_SECONDS = max(
+    0.1, float(os.getenv("SEMANTIC_QUERY_TIMEOUT_SECONDS", "3"))
+)
+SEMANTIC_FAILURE_COOLDOWN_SECONDS = max(
+    1.0, float(os.getenv("SEMANTIC_FAILURE_COOLDOWN_SECONDS", "60"))
+)
 
-DEFAULT_ASR_PROVIDER = os.getenv("DEFAULT_ASR_PROVIDER", "whisper").strip().lower()
+DEFAULT_ASR_PROVIDER = os.getenv("DEFAULT_ASR_PROVIDER", "mimo").strip().lower()
 if DEFAULT_ASR_PROVIDER not in {"whisper", "mimo"}:
-    DEFAULT_ASR_PROVIDER = "whisper"
+    DEFAULT_ASR_PROVIDER = "mimo"
 ENABLE_LOCAL_WHISPER = os.getenv("ENABLE_LOCAL_WHISPER", "1").lower() in {"1", "true", "yes", "on"}
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "large-v3")
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "zh") or None
@@ -83,7 +115,7 @@ _default_mimo_base_url = (
 )
 MIMO_BASE_URL = (os.getenv("MIMO_BASE_URL") or _default_mimo_base_url).rstrip("/")
 MIMO_ASR_MODEL = os.getenv("MIMO_ASR_MODEL", "mimo-v2.5-asr")
-MIMO_ASR_LANGUAGE = os.getenv("MIMO_ASR_LANGUAGE", os.getenv("WHISPER_LANGUAGE", "zh")) or "auto"
+MIMO_ASR_LANGUAGE = os.getenv("MIMO_ASR_LANGUAGE", "auto") or "auto"
 MIMO_ASR_CHUNK_SECONDS = int(os.getenv("MIMO_ASR_CHUNK_SECONDS", "90"))
 MIMO_ASR_MP3_BITRATE = os.getenv("MIMO_ASR_MP3_BITRATE", "32k")
 MIMO_ASR_CONCURRENCY = int(os.getenv("MIMO_ASR_CONCURRENCY", "3"))
@@ -117,7 +149,12 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 
 FRAME_FALLBACK_INTERVAL_SECONDS = int(os.getenv("FRAME_FALLBACK_INTERVAL_SECONDS", "60"))
-FRAME_MAX_COUNT = int(os.getenv("FRAME_MAX_COUNT", "24"))
+FRAME_MAX_COUNT = int(os.getenv("FRAME_MAX_COUNT", "60"))
+FRAME_TARGET_INTERVAL_SECONDS = float(os.getenv("FRAME_TARGET_INTERVAL_SECONDS", "60"))
+FRAME_MAX_GAP_SECONDS = float(os.getenv("FRAME_MAX_GAP_SECONDS", "90"))
+FRAME_SEMANTIC_MIN_SECONDS = float(os.getenv("FRAME_SEMANTIC_MIN_SECONDS", "20"))
+FRAME_SEMANTIC_MAX_SECONDS = float(os.getenv("FRAME_SEMANTIC_MAX_SECONDS", "75"))
+FRAME_COVERAGE_REPAIR_ATTEMPTS = int(os.getenv("FRAME_COVERAGE_REPAIR_ATTEMPTS", "2"))
 FRAME_ANALYSIS_FPS = float(os.getenv("FRAME_ANALYSIS_FPS", "2"))
 FRAME_ANALYSIS_WIDTH = int(os.getenv("FRAME_ANALYSIS_WIDTH", "320"))
 FRAME_OUTPUT_WIDTH = int(os.getenv("FRAME_OUTPUT_WIDTH", "736"))

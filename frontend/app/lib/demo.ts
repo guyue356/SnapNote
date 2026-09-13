@@ -1,5 +1,17 @@
 export type TaskStatus = "processing" | "completed" | "failed";
 
+export type ProcessingSubstepState = {
+  key: string;
+  label: string;
+  status: "queued" | "running" | "completed" | "degraded" | "failed" | "skipped";
+  message: string;
+  started_at?: string | null;
+  updated_at?: string | null;
+  completed_at?: string | null;
+  elapsed_seconds?: number;
+  metadata?: Record<string, unknown>;
+};
+
 export type ProcessingBranchState = {
   label: string;
   stage: string;
@@ -8,6 +20,8 @@ export type ProcessingBranchState = {
   progress: number;
   status: "queued" | "running" | "completed" | "failed" | "skipped";
   updated_at?: string | null;
+  stage_started_at?: string | null;
+  substeps?: Record<string, ProcessingSubstepState>;
 };
 
 export type SnapTask = {

@@ -30,6 +30,8 @@ from .config import (
     ENABLE_KNOWLEDGE_EMBEDDINGS,
     ENABLE_KNOWLEDGE_SEMANTIC_SEARCH,
     KNOWLEDGE_OWNER_SCOPE,
+    SEMANTIC_FAILURE_COOLDOWN_SECONDS,
+    SEMANTIC_QUERY_TIMEOUT_SECONDS,
     SEMANTIC_RECALL_K,
     TASKS_DIR,
 )
@@ -55,6 +57,10 @@ SEARCHABLE_STATUSES = {"ready", "degraded"}
 MAX_TEXT = 12_000
 _NAMESPACE = uuid.UUID("449c774f-f3fc-47cf-9b44-dbc45bbf5c54")
 _build_locks: dict[str, asyncio.Lock] = {}
+_semantic_background_tasks: set[asyncio.Task] = set()
+_semantic_unavailable_until = 0.0
+_semantic_failure_reason: str | None = None
+_embedding_builds_in_progress = 0
 logger = logging.getLogger("snapnote.knowledge")
 
 
@@ -65,7 +71,80 @@ class KnowledgeError(ValueError):
         self.summary = summary[:500]
 
 
+def _finish_semantic_task(task: asyncio.Task) -> None:
+    """Keep timed-out model warmups alive and consume their final exception."""
+    global _semantic_failure_reason, _semantic_unavailable_until
+
+    _semantic_background_tasks.discard(task)
+    if not task.cancelled():
+        error = task.exception()
+        if error is None:
+            _semantic_failure_reason = None
+            _semantic_unavailable_until = 0.0
+        else:
+            _semantic_failure_reason = str(error)
+
+
+async def _semantic_query_vector(query: str) -> list[float] | None:
+    """Return quickly when the optional local model is unavailable.
+
+    The embedding task is shielded so an initial model load can finish in the
+    background after the request has already fallen back to keyword search.
+    A cooldown prevents every keystroke from queuing another heavyweight load.
+    """
+    global _semantic_failure_reason, _semantic_unavailable_until
+
+    now = time.monotonic()
+    if now < _semantic_unavailable_until or _semantic_background_tasks:
+        return None
+
+    from .embedding import embed_query
+
+    _semantic_failure_reason = None
+    task = asyncio.create_task(embed_query(query))
+    _semantic_background_tasks.add(task)
+    task.add_done_callback(_finish_semantic_task)
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(task), timeout=SEMANTIC_QUERY_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        _semantic_unavailable_until = (
+            time.monotonic() + SEMANTIC_FAILURE_COOLDOWN_SECONDS
+        )
+        logger.warning(
+            "semantic_query_timeout",
+            extra={"timeout_seconds": SEMANTIC_QUERY_TIMEOUT_SECONDS},
+        )
+    except Exception as error:
+        _semantic_failure_reason = str(error)
+        _semantic_unavailable_until = (
+            time.monotonic() + SEMANTIC_FAILURE_COOLDOWN_SECONDS
+        )
+        logger.info("semantic_search_fallback", extra={"reason": str(error)})
+    return None
+
+
 async def rebuild_knowledge_embeddings(
+    *, asset_id: str | None = None,
+    asset_version_id: str | None = None,
+    owner_scope: str = KNOWLEDGE_OWNER_SCOPE,
+) -> dict:
+    """Generate an index while exposing in-process build progress to search."""
+    global _embedding_builds_in_progress
+
+    _embedding_builds_in_progress += 1
+    try:
+        return await _rebuild_knowledge_embeddings(
+            asset_id=asset_id,
+            asset_version_id=asset_version_id,
+            owner_scope=owner_scope,
+        )
+    finally:
+        _embedding_builds_in_progress = max(0, _embedding_builds_in_progress - 1)
+
+
+async def _rebuild_knowledge_embeddings(
     *, asset_id: str | None = None,
     asset_version_id: str | None = None,
     owner_scope: str = KNOWLEDGE_OWNER_SCOPE,
@@ -172,6 +251,53 @@ def _like_pattern(value: str) -> str:
     return f"%{escaped.lower()}%"
 
 
+_QUERY_STOP_PHRASES = (
+    "当前范围", "本地知识", "知识资产", "这个视频", "这些视频", "介绍一下",
+    "解释一下", "总结一下", "告诉我", "视频中", "视频里", "是什么",
+    "有哪些", "有什么", "为什么", "怎么办", "怎么", "如何", "是否",
+    "可以", "进行", "关于", "一下", "内容", "提到", "讲了", "说了",
+    "请问", "麻烦", "帮我", "我的", "这个", "那个", "哪些", "一个", "一些",
+    "的", "是", "在", "里", "中",
+)
+
+
+def _query_terms(query: str, limit: int = 32) -> list[str]:
+    """Extract useful lexical fallbacks from Chinese or mixed-language questions."""
+    normalized = _normalized_text(query).lower()
+    terms: list[str] = []
+
+    def add(value: str) -> None:
+        value = value.strip(" \t\r\n，。！？；：,.!?;:()（）[]【】\"'")
+        if len(value) < 2 or value in _QUERY_STOP_PHRASES or value in terms:
+            return
+        terms.append(value)
+
+    # Preserve an exact-phrase boost while adding language-aware fallback terms.
+    add(normalized)
+    for token in re.findall(r"[a-z0-9][a-z0-9_+.#/-]*", normalized):
+        add(token)
+    for group in re.findall(r"[\u3400-\u9fff]+", normalized):
+        cleaned = group
+        for phrase in sorted(_QUERY_STOP_PHRASES, key=len, reverse=True):
+            cleaned = cleaned.replace(phrase, " ")
+        pieces = re.findall(r"[\u3400-\u9fff]+", cleaned)
+        for piece in pieces:
+            add(piece)
+            if len(piece) > 2:
+                for size in range(2, min(5, len(piece) - 1) + 1):
+                    if len(piece) <= size:
+                        continue
+                    for index in range(len(piece) - size + 1):
+                        add(piece[index:index + size])
+                        if len(terms) >= limit:
+                            return terms
+    if len(terms) == 1:
+        # A question made entirely from helper words is still searchable.
+        for group in re.findall(r"[\u3400-\u9fff]{2,}", normalized):
+            add(group)
+    return terms[:limit]
+
+
 def _load_json(raw: str | None, expected: type) -> tuple[Any, bool]:
     try:
         value = json.loads(raw or ("{}" if expected is dict else "[]"))
@@ -206,6 +332,7 @@ def _source_hash(task: SnapTask) -> str:
     return _canonical_hash({
         "task_id": task.id,
         "filename": task.filename,
+        "generated_title": task.generated_title,
         "duration": round(_number(task.duration), 3),
         "frames": frames,
         "transcripts": transcripts,
@@ -217,7 +344,15 @@ def _source_hash(task: SnapTask) -> str:
 
 
 def _safe_title(task: SnapTask) -> str:
-    return (_normalized_text(Path(task.filename or "视频资产").stem) or "视频资产")[:500]
+    visual, _ = _load_json(task.visual_analysis_json, dict)
+    generated = _searchable_text(
+        task.generated_title or visual.get("video_title")
+    )
+    return (
+        generated
+        or _normalized_text(Path(task.filename or "视频资产").stem)
+        or "视频资产"
+    )[:500]
 
 
 def _valid_source_video(task: SnapTask) -> bool:
@@ -230,7 +365,7 @@ def _valid_source_video(task: SnapTask) -> bool:
 
 
 def _summary(visual: dict, notes: list[dict], markdown: str) -> str:
-    direct = _searchable_text(visual.get("summary"))
+    direct = _searchable_text(visual.get("content_summary") or visual.get("summary"))
     if direct:
         return direct[:MAX_TEXT]
     for line in (markdown or "").splitlines():
@@ -268,8 +403,8 @@ def _chapters(
         if not bounds:
             continue
         result.append({
-            "title": (_searchable_text(row.get("stage") or row.get("title")) or "未命名章节")[:500],
-            "summary": _searchable_text(row.get("description") or row.get("summary"))[:MAX_TEXT],
+            "title": (_searchable_text(row.get("title") or row.get("stage")) or "未命名章节")[:500],
+            "summary": _searchable_text(row.get("summary") or row.get("description"))[:MAX_TEXT],
             "start_time": bounds[0],
             "end_time": bounds[1],
             "source_type": source_type,
@@ -895,7 +1030,7 @@ async def search_knowledge(
     if not types or not types.issubset(CONTENT_TYPES):
         raise KnowledgeError("INVALID_CONTENT_TYPE", "内容类型不受支持")
 
-    terms = list(dict.fromkeys([query, *(term for term in query.split(" ") if term)]))
+    terms = _query_terms(query)
     term_filters = []
     for term in terms:
         pattern = _like_pattern(term)
@@ -913,7 +1048,50 @@ async def search_knowledge(
     ]
     if asset_ids is not None:
         base_filters.append(KnowledgeAsset.id.in_(asset_ids))
-    keyword_filters = [*base_filters, or_(*term_filters)]
+    keyword_filters = [*base_filters, or_(False, *term_filters)]
+
+    # Check for a usable index with a short-lived session, then release the
+    # database before a potentially slow first-time model load. This keeps
+    # asset listing and other note APIs responsive while semantic search warms.
+    semantic_requested = ENABLE_KNOWLEDGE_SEMANTIC_SEARCH
+    semantic_index_available = False
+    semantic_total_chunks = 0
+    semantic_indexed_chunks = 0
+    if semantic_requested:
+        async with async_session() as index_db:
+            index_scope_filters = [
+                KnowledgeAsset.owner_scope == owner_scope,
+                KnowledgeAsset.status.in_(SEARCHABLE_STATUSES),
+                KnowledgeAsset.current_version_id == KnowledgeAssetVersion.id,
+            ]
+            if asset_ids is not None:
+                index_scope_filters.append(KnowledgeAsset.id.in_(asset_ids))
+            semantic_total_chunks, semantic_indexed_chunks = (await index_db.execute(
+                select(
+                    func.count(KnowledgeChunk.id),
+                    func.count(KnowledgeEmbedding.id),
+                ).select_from(KnowledgeChunk).join(
+                    KnowledgeAssetVersion,
+                    KnowledgeAssetVersion.id == KnowledgeChunk.asset_version_id,
+                ).join(
+                    KnowledgeAsset,
+                    KnowledgeAsset.id == KnowledgeAssetVersion.asset_id,
+                ).outerjoin(
+                    KnowledgeEmbedding,
+                    and_(
+                        KnowledgeEmbedding.chunk_id == KnowledgeChunk.id,
+                        KnowledgeEmbedding.model_name == EMBEDDING_MODEL_NAME,
+                        KnowledgeEmbedding.model_version == EMBEDDING_MODEL_VERSION,
+                    ),
+                ).where(*index_scope_filters)
+            )).one()
+            semantic_total_chunks = int(semantic_total_chunks or 0)
+            semantic_indexed_chunks = int(semantic_indexed_chunks or 0)
+            semantic_index_available = semantic_indexed_chunks > 0
+    query_vector = (
+        await _semantic_query_vector(query) if semantic_index_available else None
+    )
+
     async with async_session() as db:
         available_count = (await db.execute(select(func.count()).select_from(KnowledgeAsset).where(
             KnowledgeAsset.owner_scope == owner_scope,
@@ -931,12 +1109,8 @@ async def search_knowledge(
 
         semantic_scores: dict[str, float] = {}
         semantic_rows = []
-        semantic_requested = ENABLE_KNOWLEDGE_SEMANTIC_SEARCH
-        if semantic_requested:
+        if query_vector is not None:
             try:
-                from .embedding import embed_query
-
-                query_vector = await embed_query(query)
                 semantic_filter = [
                     *base_filters,
                     KnowledgeEmbedding.model_name == EMBEDDING_MODEL_NAME,
@@ -1010,9 +1184,23 @@ async def search_knowledge(
             title_hit = any(term in asset.title.lower() for term in lowered_terms)
             chapter_hit = bool(chapter and any(term in chapter.title.lower() for term in lowered_terms))
             chunk_title_hit = any(term in (chunk.title or "").lower() for term in lowered_terms)
-            occurrences = sum(chunk.text.lower().count(term) for term in lowered_terms) + int(title_hit) + int(chapter_hit)
+            searchable_fields = (
+                asset.title.lower(), chapter.title.lower() if chapter else "",
+                (chunk.title or "").lower(), chunk.text.lower(),
+            )
+            matched_terms = {
+                term for term in lowered_terms if any(term in field for field in searchable_fields)
+            }
+            occurrences = sum(
+                min(3, chunk.text.lower().count(term)) for term in matched_terms
+            ) + int(title_hit) + int(chapter_hit)
             has_keyword = bool(title_hit or chapter_hit or chunk_title_hit or occurrences)
-            keyword = min(1.0, 0.55 + 0.15 * max(0, occurrences - 1)) if has_keyword else 0.0
+            coverage = len(matched_terms) / max(1, min(len(lowered_terms), 8))
+            exact_hit = any(query.lower() in field for field in searchable_fields)
+            keyword = min(
+                1.0, 0.42 + 0.28 * coverage + 0.12 * int(exact_hit)
+                + 0.05 * min(3, occurrences)
+            ) if has_keyword else 0.0
             field_score = 1.0 if title_hit else 0.8 if chapter_hit or chunk_title_hit else 0.4
             timed = chunk.start_time is not None and chunk.end_time is not None
             evidence = 1.0 if timed else 0.6
@@ -1027,9 +1215,8 @@ async def search_knowledge(
                 if not has_keyword:
                     matched_field = "semantic"
                 score = round(
-                    0.45 * keyword + 0.45 * semantic_scores.get(chunk.id, 0.0)
-                    + 0.10 * evidence,
-                    6,
+                    0.30 * keyword + 0.60 * semantic_scores.get(chunk.id, 0.0)
+                    + 0.10 * evidence, 6,
                 )
             else:
                 score = round(0.75 * keyword + 0.15 * field_score + 0.10 * evidence, 6)
@@ -1038,6 +1225,7 @@ async def search_knowledge(
                 "task_id": asset.task_id,
                 "asset_version_id": version.id, "asset_title": asset.title,
                 "content_type": chunk.content_type,
+                "title": chunk.title,
                 "chapter_id": chapter.id if chapter else None,
                 "chapter_title": chapter.title if chapter else None,
                 "text": chunk.text, "start_time": chunk.start_time, "end_time": chunk.end_time,
@@ -1054,11 +1242,34 @@ async def search_knowledge(
         for row in results:
             row.pop("_updated", None)
             row.pop("_chapter_time", None)
+        if not semantic_requested:
+            semantic_status = "disabled"
+        elif _semantic_failure_reason:
+            semantic_status = "model_error"
+        elif (
+            _embedding_builds_in_progress
+            or _semantic_background_tasks
+            or (semantic_index_available and query_vector is None)
+        ):
+            semantic_status = "indexing"
+        elif semantic_indexed_chunks < semantic_total_chunks:
+            semantic_status = "partial"
+        else:
+            semantic_status = "ready"
         response = {
             "query": query, "scope": {"asset_ids": asset_ids, "owner_scope": owner_scope},
             "results": results, "total": len(results), "available_assets": available_count,
             "degraded_search": semantic_requested and not semantic_active,
             "retrieval_mode": "hybrid" if semantic_active else "keyword",
+            "semantic_status": semantic_status,
+            "semantic_error": _semantic_failure_reason if semantic_status == "model_error" else None,
+            "semantic_index": {
+                "indexed_chunks": semantic_indexed_chunks,
+                "total_chunks": semantic_total_chunks,
+                "coverage": round(
+                    semantic_indexed_chunks / semantic_total_chunks, 4
+                ) if semantic_total_chunks else 1.0,
+            },
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
         }
         logger.info("knowledge_search_completed", extra={

@@ -24,7 +24,7 @@ export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState("");
-  const [asr, setAsr] = useState<"mimo" | "whisper">("whisper");
+  const [asr, setAsr] = useState<"mimo" | "whisper">("mimo");
   const [style, setStyle] = useState<"classroom" | "meeting">("classroom");
   const [noteModel, setNoteModel] = useState<"mimo" | "deepseek">("mimo");
   const [dragging, setDragging] = useState(false);
@@ -141,12 +141,12 @@ export default function Home() {
 
   return (
     <main className="site-shell">
-      <BrandHeader />
+      <BrandHeader variant="marketing" />
 
       <section className="hero wrap">
         <div className="hero-copy">
           <div className="eyebrow"><span className="spark">✦</span> AI 多模态笔记</div>
-          <h1>SnapNote<br /><span>把知识视频，变成可检索的多模态笔记</span></h1>
+          <h1>把知识视频，<br /><span>变成可检索的多模态笔记</span></h1>
           <p className="hero-lead">
             自动提取关键画面、转写语音内容，并与时间轴精准对齐，每条笔记都能定位关键画面，处理 30 分钟视频，模型成本仅需约 0.5 元。
           </p>

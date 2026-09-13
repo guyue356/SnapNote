@@ -1,7 +1,7 @@
 "use client";
 /* eslint-disable @next/next/no-img-element */
 
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import BrandHeader from "../components/BrandHeader";
 import SlideVisual from "../components/SlideVisual";
@@ -75,6 +75,15 @@ function searchTime(seconds: number | null) {
   return seconds === null ? "视频摘要" : formatDuration(Math.max(0, seconds));
 }
 
+function searchHitTitle(hit: KnowledgeSearchResponse["results"][number]) {
+  const title = hit.title?.trim() || hit.chapter_title?.trim();
+  if (title) return title;
+  if (hit.content_type === "transcript") return `原文片段 · ${searchTime(hit.start_time)}`;
+  if (hit.content_type === "video_summary") return "视频摘要";
+  if (hit.content_type === "note") return "知识笔记";
+  return "章节摘要";
+}
+
 export default function NotesPage() {
   const router = useRouter();
   const localTasks = useSyncExternalStore(subscribeLocalTasks, getLocalTasksSnapshot, getLocalTasksServerSnapshot);
@@ -83,6 +92,7 @@ export default function NotesPage() {
   const [error, setError] = useState("");
   const [actionError, setActionError] = useState("");
   const [deletingTaskId, setDeletingTaskId] = useState("");
+  const [pendingDeleteTask, setPendingDeleteTask] = useState<SnapTask | null>(null);
   const [query, setQuery] = useState("");
   const [searchFilter, setSearchFilter] = useState<SearchFilter>("all");
   const [searchReady, setSearchReady] = useState(false);
@@ -90,9 +100,11 @@ export default function NotesPage() {
   const [searchError, setSearchError] = useState("");
   const [searchResponse, setSearchResponse] = useState<KnowledgeSearchResponse>();
   const [searchRevision, setSearchRevision] = useState(0);
+  const semanticPollCountRef = useRef(0);
   const tasks = (hasBackend ? remoteTasks : localTasks)
     .slice()
     .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
+  const completedCount = tasks.filter((task) => task.status === "completed").length;
   const cleanQuery = normalizeSearch(query);
   const hasQuery = Boolean(cleanQuery);
   const selectedFilter = SEARCH_FILTERS.find((item) => item.value === searchFilter) || SEARCH_FILTERS[0];
@@ -112,6 +124,15 @@ export default function NotesPage() {
   }, []);
 
   useEffect(() => {
+    if (!pendingDeleteTask) return;
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape" && !deletingTaskId) setPendingDeleteTask(null);
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [deletingTaskId, pendingDeleteTask]);
+
+  useEffect(() => {
     if (!searchReady) return;
     const timer = window.setTimeout(() => {
       const url = new URL(window.location.href);
@@ -125,12 +146,10 @@ export default function NotesPage() {
   useEffect(() => {
     if (!searchReady || !hasBackend || !cleanQuery) return;
     const controller = new AbortController();
-    const loadingTimer = window.setTimeout(() => {
-      setSearching(true);
-      setSearchError("");
-      setSearchResponse(undefined);
-    }, 0);
+    let slowTimer: number | undefined;
     const timer = window.setTimeout(() => {
+      setSearchError("");
+      slowTimer = window.setTimeout(() => setSearching(true), 500);
       searchKnowledge(cleanQuery, selectedFilter.types, controller.signal)
         .then((result) => {
           if (!controller.signal.aborted) setSearchResponse(result);
@@ -141,15 +160,31 @@ export default function NotesPage() {
           }
         })
         .finally(() => {
+          if (slowTimer !== undefined) window.clearTimeout(slowTimer);
           if (!controller.signal.aborted) setSearching(false);
         });
     }, 300);
     return () => {
-      window.clearTimeout(loadingTimer);
       window.clearTimeout(timer);
+      if (slowTimer !== undefined) window.clearTimeout(slowTimer);
       controller.abort();
     };
   }, [cleanQuery, searchFilter, searchReady, searchRevision, selectedFilter.types]);
+
+  useEffect(() => {
+    semanticPollCountRef.current = 0;
+  }, [cleanQuery, searchFilter]);
+
+  useEffect(() => {
+    if (!cleanQuery || searchResponse?.query !== cleanQuery || searchResponse.semantic_status !== "indexing") return;
+    if (semanticPollCountRef.current >= 8) return;
+    const delay = Math.min(1500 * (2 ** semanticPollCountRef.current), 10_000);
+    const timer = window.setTimeout(() => {
+      semanticPollCountRef.current += 1;
+      setSearchRevision((value) => value + 1);
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [cleanQuery, searchResponse]);
 
   useEffect(() => {
     if (!hasBackend) return;
@@ -181,10 +216,15 @@ export default function NotesPage() {
     setSearchFilter("all");
   }
 
-  async function deleteFailedTask(task: SnapTask) {
-    if (deletingTaskId || !window.confirm(
-      `确认删除失败任务“${task.title}”？\n\n原视频、处理结果和关联知识数据都会被清理，且无法恢复。`
-    )) return;
+  function requestDeleteTask(task: SnapTask) {
+    if (deletingTaskId) return;
+    setActionError("");
+    setPendingDeleteTask(task);
+  }
+
+  async function confirmDeleteTask() {
+    const task = pendingDeleteTask;
+    if (!task || deletingTaskId) return;
     setDeletingTaskId(task.id);
     setActionError("");
     try {
@@ -194,6 +234,7 @@ export default function NotesPage() {
       } else {
         deleteLocalTask(task.id);
       }
+      setPendingDeleteTask(null);
     } catch (problem) {
       setActionError(problem instanceof Error ? problem.message : "删除清理未完成，请稍后重试。");
     } finally {
@@ -222,11 +263,15 @@ export default function NotesPage() {
                 </div>
                 <div className="library-card-copy"><h2 title={task.title}>{task.title}</h2></div>
               </button>
-              {task.status === "failed" && (
-                <button className="library-delete icon-tooltip" data-tooltip="删除任务" type="button" onClick={() => deleteFailedTask(task)} disabled={deletingTaskId === task.id} aria-label={`删除 ${task.title}`}>
-                  {deletingTaskId === task.id ? "…" : "×"}
-                </button>
-              )}
+              <button className="library-delete icon-tooltip" data-tooltip="删除视频" type="button" onClick={() => requestDeleteTask(task)} disabled={Boolean(deletingTaskId)} aria-label={`删除 ${task.title}`}>
+                {deletingTaskId === task.id ? (
+                  <span className="library-delete-busy" aria-hidden="true" />
+                ) : (
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5" />
+                  </svg>
+                )}
+              </button>
             </article>
           );
         })}
@@ -236,15 +281,19 @@ export default function NotesPage() {
 
   return (
     <main className="site-shell notes-page">
-      <BrandHeader compact />
+      <BrandHeader variant="library" />
       <section className="notes-library wrap">
         <div className="library-heading">
           <div>
-            <span className="step-kicker">YOUR LIBRARY</span>
+            <span className="step-kicker">知识资产</span>
             <h1>笔记管理</h1>
-            <p>浏览所有视频资产，也可以搜索章节、笔记和视频原文。</p>
+            <p>浏览、搜索和管理所有视频知识资产。</p>
+            <div className="library-heading-meta"><span>{tasks.length} 个视频</span><span>{completedCount} 个已完成</span></div>
           </div>
-          <button type="button" className="primary-compact" onClick={() => router.push("/#upload")}>＋ 上传新视频</button>
+          <div className="library-heading-actions">
+            <button type="button" className="secondary-compact" onClick={() => router.push("/assistant")}>✦ 打开知识助手</button>
+            <button type="button" className="primary-compact" onClick={() => router.push("/#upload")}>＋ 上传视频</button>
+          </div>
         </div>
 
         <section className="library-search" aria-label="搜索视频知识资产">
@@ -275,7 +324,7 @@ export default function NotesPage() {
               </div>
             ) : <small>演示模式仅检索视频标题</small>}
             {hasQuery && hasBackend && searchResponse && (
-              <span className="library-search-count" aria-live="polite">{searchResponse.total} 条结果 · {searchResponse.available_assets} 个可检索视频</span>
+              <span className="library-search-count" aria-live="polite">{searchResponse.total} 条结果 · {searchResponse.available_assets} 个可检索视频{searching && <i className="library-search-refresh" aria-label="正在后台更新" />}</span>
             )}
           </div>
         </section>
@@ -284,24 +333,31 @@ export default function NotesPage() {
         {actionError && <p className="library-action-error" role="alert">{actionError}</p>}
         {hasQuery && hasBackend ? (
           <section className="search-result-area" aria-label="搜索结果" aria-busy={searching}>
-            {searching ? (
-              <div className="search-result-list" role="status" aria-label="正在检索知识资产">
-                {[0, 1, 2].map((item) => <div className="search-result-card search-result-skeleton" key={item}><i /><b /><span /></div>)}
+            {searchError && searchResponse && (
+              <div className="search-result-inline-error" role="alert">
+                <span>结果更新失败，当前仍显示上一次结果。</span>
+                <button type="button" onClick={() => setSearchRevision((value) => value + 1)}>重试</button>
               </div>
-            ) : searchError ? (
+            )}
+            {searchError && !searchResponse ? (
               <div className="search-result-empty search-result-error" role="alert">
                 <span>!</span><h2>暂时无法完成检索</h2><p>{searchError}</p>
                 <button type="button" onClick={() => setSearchRevision((value) => value + 1)}>重试</button>
               </div>
             ) : searchResponse?.results.length ? (
               <div className="search-result-list">
-                <div className="search-result-mode" role="status">
-                  {searchResponse.retrieval_mode === "hybrid"
-                    ? "语义 + 关键词混合检索"
-                    : searchResponse.degraded_search
-                      ? "当前使用关键词检索，语义索引尚未就绪"
-                      : "关键词检索"}
-                </div>
+                {(searchResponse.semantic_status === "partial" || searchResponse.semantic_status === "model_error") && (
+                  <div className="search-result-mode" role="status">
+                  {searchResponse.semantic_status === "partial" && (
+                    <span className="partial">
+                      部分笔记未索引 · {searchResponse.semantic_index.indexed_chunks}/{searchResponse.semantic_index.total_chunks}
+                    </span>
+                  )}
+                  {searchResponse.semantic_status === "model_error" && (
+                    <span className="model-error" title={searchResponse.semantic_error || undefined}>模型加载失败</span>
+                  )}
+                  </div>
+                )}
                 {searchResponse.results.map((hit) => (
                   <button className="search-result-card" type="button" key={hit.chunk_id} onClick={() => openSearchHit(hit.task_id, hit.start_time)}>
                     {hit.keyframe?.availability === "available" && hit.keyframe.relative_uri ? (
@@ -309,11 +365,11 @@ export default function NotesPage() {
                     ) : <span className="search-result-glyph" aria-hidden="true">⌁</span>}
                     <span className="search-result-copy">
                       <span className="search-result-topline">
-                        <strong><HighlightedText text={hit.asset_title} query={cleanQuery} /></strong>
+                        <strong><HighlightedText text={searchHitTitle(hit)} query={searchResponse.query} /></strong>
                         <em>{CONTENT_LABELS[hit.content_type]}</em>
                       </span>
-                      {hit.chapter_title && <b><HighlightedText text={hit.chapter_title} query={cleanQuery} /></b>}
-                      <span className="search-result-snippet"><HighlightedText text={excerpt(hit.text, cleanQuery)} query={cleanQuery} /></span>
+                      <b className="search-result-source">来自《<HighlightedText text={hit.asset_title} query={searchResponse.query} />》</b>
+                      <span className="search-result-snippet"><HighlightedText text={excerpt(hit.text, searchResponse.query)} query={searchResponse.query} /></span>
                       <span className="search-result-meta">
                         <time>▶ {searchTime(hit.start_time)}</time>
                         {hit.source_status === "degraded" && <i>部分内容可用</i>}
@@ -349,6 +405,20 @@ export default function NotesPage() {
         )}
       </section>
       <footer className="footer wrap"><span>SnapNote <b>✦</b></span><p>所有视频笔记，都在一个地方。</p><small>{tasks.length} 个视频资产</small></footer>
+      {pendingDeleteTask && (
+        <div className="confirm-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !deletingTaskId) setPendingDeleteTask(null); }}>
+          <section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title" aria-describedby="delete-dialog-description">
+            <div className="confirm-dialog-icon" aria-hidden="true">×</div>
+            <h2 id="delete-dialog-title">确认删除视频？</h2>
+            <p id="delete-dialog-description">以下视频及其处理结果、关联知识数据都会被清理，且无法恢复。</p>
+            <div className="confirm-video-name" title={pendingDeleteTask.title}>{pendingDeleteTask.title}</div>
+            <div className="confirm-dialog-actions">
+              <button type="button" className="confirm-cancel" onClick={() => setPendingDeleteTask(null)} disabled={Boolean(deletingTaskId)} autoFocus>取消</button>
+              <button type="button" className="confirm-delete" onClick={confirmDeleteTask} disabled={Boolean(deletingTaskId)}>{deletingTaskId ? "正在删除…" : "确认删除"}</button>
+            </div>
+          </section>
+        </div>
+      )}
     </main>
   );
 }

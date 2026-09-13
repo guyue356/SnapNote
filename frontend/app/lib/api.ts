@@ -20,6 +20,10 @@ export type BackendNote = {
 
 export type BackendVisualAnalysis = {
   summary?: string;
+  content_summary?: string;
+  visual_summary?: string;
+  video_title?: string;
+  title_confidence?: number;
   content_type?: string;
   target_audience?: string;
   hook?: string;
@@ -28,8 +32,8 @@ export type BackendVisualAnalysis = {
   viral_elements?: string[];
   recurring_patterns?: string[];
   recommendations?: string[];
-  structure?: Array<{ stage: string; start_time: number; end_time: number; description: string }>;
-  narrative_structure?: Array<{ stage: string; start_time: number; end_time: number; description: string }>;
+  structure?: Array<{ title?: string; stage?: string; stage_role?: string; start_time: number; end_time: number; summary?: string; description?: string }>;
+  narrative_structure?: Array<{ title?: string; stage?: string; stage_role?: string; start_time: number; end_time: number; summary?: string; description?: string }>;
   storyboard?: Array<{ start_time: number; end_time: number; shot: string; purpose: string }>;
   provider?: string;
 };
@@ -52,6 +56,7 @@ export type KnowledgeSearchHit = {
   asset_version_id: string;
   asset_title: string;
   content_type: KnowledgeContentType;
+  title: string | null;
   chapter_id: string | null;
   chapter_title: string | null;
   text: string;
@@ -78,13 +83,185 @@ export type KnowledgeSearchResponse = {
   available_assets: number;
   degraded_search: boolean;
   retrieval_mode: "hybrid" | "keyword";
+  semantic_status: "disabled" | "indexing" | "partial" | "model_error" | "ready";
+  semantic_error: string | null;
+  semantic_index: {
+    indexed_chunks: number;
+    total_chunks: number;
+    coverage: number;
+  };
   elapsed_ms: number;
 };
+
+export type AssistantScope = {
+  asset_ids: string[] | null;
+  content_types: KnowledgeContentType[] | null;
+  created_after: string | null;
+  created_before: string | null;
+};
+
+export type AssistantConversation = {
+  id: string;
+  owner_scope: string;
+  title: string;
+  status: "active" | "archived";
+  default_scope: AssistantScope;
+  scope_label: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AssistantCitation = {
+  ordinal: number;
+  asset_id: string;
+  task_id: string;
+  asset_version_id: string;
+  chunk_id: string;
+  chapter_id: string | null;
+  asset_title: string;
+  content_type?: KnowledgeContentType;
+  chapter_title?: string | null;
+  start_time: number | null;
+  end_time: number | null;
+  text: string;
+  keyframe: { id?: string; relative_uri?: string; timestamp?: number; availability: string } | null;
+  availability: "available" | "unavailable";
+};
+
+export type AssistantAssetResult = {
+  asset_id: string;
+  task_id: string;
+  title: string;
+  status: "ready" | "degraded";
+  updated_at: string;
+};
+
+export type AssistantMessage = {
+  id: string;
+  role: "user" | "assistant" | "system";
+  intent: "asset_query" | "knowledge_qa" | "unsupported_action";
+  status: "pending" | "retrieving" | "streaming" | "completed" | "failed" | "cancelled";
+  content: string;
+  scope_snapshot: AssistantScope;
+  retrieval: Record<string, unknown>;
+  error_code?: string | null;
+  created_at: string;
+  citations: AssistantCitation[];
+  asset_results?: { items: AssistantAssetResult[]; total: number };
+};
+
+export type AssistantSseEvent = { event: string; data: Record<string, unknown> };
+
+function assistantError(response: Response, fallback: string) {
+  return response.json().catch(() => ({})).then((payload) => {
+    const detail = payload.detail;
+    return new Error(typeof detail === "string" ? detail : typeof detail?.summary === "string" ? detail.summary : fallback);
+  });
+}
+
+export async function createAssistantConversation(defaultScope?: Partial<AssistantScope>): Promise<AssistantConversation> {
+  const response = await fetch(`${API_BASE}/api/assistant/conversations`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ owner_scope: "local", default_scope: { asset_ids: null, content_types: null, created_after: null, created_before: null, ...defaultScope } }),
+  });
+  if (!response.ok) throw await assistantError(response, "无法创建助手会话");
+  return response.json();
+}
+
+export async function fetchAssistantConversations(status: "active" | "archived" = "active"): Promise<AssistantConversation[]> {
+  const params = new URLSearchParams({ owner_scope: "local", status });
+  const response = await fetch(`${API_BASE}/api/assistant/conversations?${params}`, { cache: "no-store" });
+  if (!response.ok) throw await assistantError(response, "无法读取助手会话");
+  return response.json();
+}
+
+async function updateAssistantConversationStatus(id: string, action: "archive" | "restore"): Promise<AssistantConversation> {
+  const response = await fetch(`${API_BASE}/api/assistant/conversations/${id}/${action}`, { method: "POST" });
+  if (!response.ok) throw await assistantError(response, action === "archive" ? "无法归档会话" : "无法恢复会话");
+  return response.json();
+}
+
+export function archiveAssistantConversation(id: string) {
+  return updateAssistantConversationStatus(id, "archive");
+}
+
+export function restoreAssistantConversation(id: string) {
+  return updateAssistantConversationStatus(id, "restore");
+}
+
+export async function deleteAssistantConversation(id: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/assistant/conversations/${id}`, { method: "DELETE" });
+  if (!response.ok) throw await assistantError(response, "无法永久删除会话");
+}
+
+export async function fetchAssistantMessages(id: string): Promise<{ conversation: AssistantConversation; messages: AssistantMessage[] }> {
+  const response = await fetch(`${API_BASE}/api/assistant/conversations/${id}/messages`, { cache: "no-store" });
+  if (!response.ok) throw await assistantError(response, "无法读取会话内容");
+  return response.json();
+}
+
+export async function updateAssistantScope(id: string, scope: AssistantScope): Promise<AssistantConversation> {
+  const response = await fetch(`${API_BASE}/api/assistant/conversations/${id}/scope`, {
+    method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scope }),
+  });
+  if (!response.ok) throw await assistantError(response, "无法更新知识范围");
+  return response.json();
+}
+
+export async function fetchAssistantScopeAssets(scope: AssistantScope): Promise<{ total: number; items: AssistantAssetResult[]; scope_label: string }> {
+  const params = new URLSearchParams({ owner_scope: "local" });
+  if (scope.asset_ids) params.set("asset_ids", scope.asset_ids.join(","));
+  if (scope.content_types) params.set("content_types", scope.content_types.join(","));
+  if (scope.created_after) params.set("created_after", scope.created_after);
+  if (scope.created_before) params.set("created_before", scope.created_before);
+  const response = await fetch(`${API_BASE}/api/assistant/scope/assets?${params}`, { cache: "no-store" });
+  if (!response.ok) throw await assistantError(response, "无法读取知识范围");
+  return response.json();
+}
+
+export async function streamAssistantMessage(
+  id: string,
+  payload: { content: string; client_request_id: string; scope_override?: AssistantScope },
+  onEvent: (event: AssistantSseEvent) => void,
+  signal?: AbortSignal,
+) {
+  const response = await fetch(`${API_BASE}/api/assistant/conversations/${id}/messages`, {
+    method: "POST", headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify(payload), signal,
+  });
+  if (!response.ok) throw await assistantError(response, "助手暂时无法回答");
+  if (!response.body) throw new Error("助手连接没有返回内容");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const consume = (chunk: string) => {
+    buffer += chunk;
+    const parts = buffer.split(/\r?\n\r?\n/);
+    buffer = parts.pop() || "";
+    for (const part of parts) {
+      const event = part.match(/^event:\s*(.+)$/m)?.[1] || "message";
+      const data = part.match(/^data:\s*(.+)$/m)?.[1];
+      if (!data) continue;
+      try { onEvent({ event, data: JSON.parse(data) }); } catch { /* ignore malformed heartbeat */ }
+    }
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    consume(decoder.decode(value, { stream: true }));
+  }
+  consume(decoder.decode());
+}
+
+export async function cancelAssistantMessage(id: string) {
+  await fetch(`${API_BASE}/api/assistant/messages/${id}/cancel`, { method: "POST" });
+}
 
 export type BackendTask = {
   id: string;
   filename: string;
   title: string;
+  generated_title?: string | null;
   duration: number;
   status: "queued" | "processing" | "completed" | "failed";
   current_stage: string;

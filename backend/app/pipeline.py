@@ -4,6 +4,7 @@ import math
 import re
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import delete, select
@@ -18,6 +19,7 @@ from .config import (
     ENABLE_PIPELINE_PARALLELISM,
     FFMPEG_BIN,
     FFPROBE_BIN,
+    FRAME_COVERAGE_REPAIR_ATTEMPTS,
     MAX_VIDEO_DURATION_SECONDS,
     MIMO_API_KEY,
     MIMO_BASE_URL,
@@ -39,9 +41,13 @@ from .knowledge import build_knowledge_asset
 from .sse_manager import sse_manager
 from .vision import (
     analyze_shots,
+    audit_frame_coverage,
+    build_semantic_units,
     create_silent_proxy_clips,
     deduplicate_frames,
     extract_keyframes,
+    select_coverage_repairs,
+    select_shots_for_semantic_coverage,
 )
 
 
@@ -57,7 +63,12 @@ STAGES = [
     ("running_ocr", 56, "跳过本地 OCR", "直接使用 MiMo 视觉理解关键帧及画面文字"),
     ("understanding_frames", 68, "MiMo 关键帧理解", "正在批量分析主体、场景、构图与素材风格"),
     ("understanding_clips", 76, "MiMo 动态片段理解", "正在补充动作、运镜、转场与节奏信息"),
-    ("analyzing_style", 84, "整片风格与分镜分析", "正在归纳叙事结构、视觉风格和爆款元素"),
+    (
+        "analyzing_style",
+        84,
+        "AI 整片分析与笔记增强",
+        "正在等待 AI 归纳整片风格并增强笔记结构",
+    ),
     ("aligning", 89, "图文时间对齐", "正在绑定镜头、视觉语义与语音转写"),
     ("generating_blocks", 94, "生成结构化笔记", "正在生成逐镜头摘要、重点和复习问题"),
     ("generating_note", 98, "生成完整结果", "正在组织 Markdown 与分析产物"),
@@ -70,7 +81,89 @@ BRANCHES = {
     "multimodal": {"label": "多模态理解", "weight": 30},
     "output": {"label": "结果生成", "weight": 10},
 }
+BRANCH_SUBSTEPS = {
+    "vision": [
+        ("semantic_selection", "语义覆盖选帧", "等待语音与镜头候选汇合"),
+        ("frame_extraction", "关键帧抽取", "等待微语义单元选帧完成"),
+        ("coverage_audit", "覆盖审计", "等待检查语义覆盖率和时间空洞"),
+        ("coverage_repair", "定向补帧", "仅在存在缺失单元或时间空洞时执行"),
+    ],
+    "multimodal": [
+        ("keyframe_understanding", "关键帧理解", "等待关键帧准备完成"),
+        ("clip_understanding", "动态片段理解", "等待关键帧理解完成"),
+        ("style_synthesis", "整片分析", "等待静态与动态视觉结果"),
+        ("note_enhancement", "笔记增强", "等待图文对齐材料准备完成"),
+    ],
+}
 _progress_locks: dict[str, asyncio.Lock] = {}
+
+_GENERIC_CONTENT_TITLES = {
+    "开篇", "开场", "引言", "介绍", "背景", "标准", "分析", "案例",
+    "正文", "主体", "展开", "总结", "结尾", "结束", "主要内容", "完整内容",
+}
+
+
+def _clean_content_text(value, maximum: int) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:maximum]
+
+
+def _content_focused_title(title, summary, fallback: str) -> str:
+    candidate = _clean_content_text(title, 120)
+    compact = re.sub(r"[\s:：,，。.!！?？、\-]", "", candidate)
+    generic = compact in _GENERIC_CONTENT_TITLES or bool(
+        re.fullmatch(r"第?[一二三四五六七八九十\d]+(?:部分|章节|节|段)", compact)
+    )
+    if candidate and not generic:
+        return candidate
+    summary_text = _clean_content_text(summary, 300)
+    if summary_text:
+        return re.split(r"[。！？；\n]", summary_text, maxsplit=1)[0][:30]
+    return fallback
+
+
+def _clean_content_list(value, fallback: list[str], maximum: int = 8) -> list[str]:
+    if not isinstance(value, list):
+        return fallback
+    cleaned = [_clean_content_text(item, 500) for item in value]
+    result = list(dict.fromkeys(item for item in cleaned if item))[:maximum]
+    return result or fallback
+
+
+def _merge_enhanced_blocks(base_blocks: list[dict], enhanced_blocks: list[dict]) -> list[dict]:
+    """Accept only editable content from the model and preserve source-grounded fields."""
+    by_id = {
+        str(item.get("id")): item
+        for item in enhanced_blocks
+        if isinstance(item, dict) and item.get("id")
+    }
+    has_identifiers = bool(by_id)
+    merged = []
+    for index, base in enumerate(base_blocks):
+        candidate = by_id.get(str(base.get("id")))
+        if candidate is None and not has_identifiers and index < len(enhanced_blocks):
+            indexed = enhanced_blocks[index]
+            candidate = indexed if isinstance(indexed, dict) else {}
+        candidate = candidate or {}
+        summary = _clean_content_text(candidate.get("summary"), 1200) or base["summary"]
+        merged.append({
+            **base,
+            "summary": summary,
+            "title": _content_focused_title(
+                candidate.get("title"), summary, base["title"]
+            ),
+            "key_points": _clean_content_list(
+                candidate.get("key_points"), base.get("key_points", []), 8
+            ),
+            "review_questions": _clean_content_list(
+                candidate.get("review_questions"), base.get("review_questions", []), 6
+            ),
+        })
+    return merged
+
+
+def _video_title(visual_analysis: dict) -> str | None:
+    title = _clean_content_text(visual_analysis.get("video_title"), 500)
+    return title or None
 
 
 def new_processing_state() -> dict:
@@ -83,6 +176,16 @@ def new_processing_state() -> dict:
             "progress": 0,
             "status": "queued",
             "updated_at": None,
+            "stage_started_at": None,
+            "substeps": {
+                key: {
+                    "key": key,
+                    "label": label,
+                    "status": "queued",
+                    "message": message,
+                }
+                for key, label, message in BRANCH_SUBSTEPS.get(name, [])
+            },
         }
         for name, metadata in BRANCHES.items()
     }
@@ -141,13 +244,18 @@ async def _update_pipeline_state(
                 max(0, min(100, int(branch_progress))),
             )
             completed = result is not None
+            timestamp = utcnow()
+            stage_started_at = state[branch].get("stage_started_at")
+            if state[branch].get("stage") != stage or not stage_started_at:
+                stage_started_at = timestamp.isoformat()
             state[branch].update({
                 "stage": stage,
                 "title": title,
                 "message": message,
                 "progress": progress,
                 "status": "completed" if completed and progress >= 100 else "running",
-                "updated_at": utcnow().isoformat(),
+                "updated_at": timestamp.isoformat(),
+                "stage_started_at": stage_started_at,
             })
             overall = max(int(task.progress or 0), _overall_progress(state))
             task.status = "processing"
@@ -201,6 +309,115 @@ async def _update_pipeline_state(
                 **(result or {}),
             }
     await sse_manager.emit(task_id, stage, payload)
+
+
+async def _record_pipeline_substep(
+    task_id: str,
+    branch: str,
+    key: str,
+    label: str,
+    status: str,
+    message: str,
+    metadata: dict | None = None,
+):
+    """Persist independently-running work without changing overall progress.
+
+    Substeps live inside processing_state_json so they are available through the
+    existing task API and survive SSE reconnects, page refreshes, and restarts.
+    """
+    if branch not in BRANCHES:
+        raise ValueError(f"Unknown pipeline branch: {branch}")
+    if status not in {"running", "completed", "degraded", "failed", "skipped"}:
+        raise ValueError(f"Unknown pipeline substep status: {status}")
+    lock = _progress_locks.setdefault(task_id, asyncio.Lock())
+    async with lock:
+        async with async_session() as db:
+            task = await db.get(SnapTask, task_id)
+            if not task:
+                raise RuntimeError("任务已不存在")
+            state = _decode_processing_state(task.processing_state_json)
+            branch_state = state[branch]
+            substeps = dict(branch_state.get("substeps") or {})
+            previous = dict(substeps.get(key) or {})
+            timestamp = utcnow()
+            started_at = previous.get("started_at") or timestamp.isoformat()
+            row = {
+                **previous,
+                "key": key,
+                "label": label,
+                "status": status,
+                "message": message,
+                "started_at": started_at,
+                "updated_at": timestamp.isoformat(),
+            }
+            if metadata is not None:
+                row["metadata"] = metadata
+            if status != "running":
+                row["completed_at"] = timestamp.isoformat()
+                try:
+                    started = datetime.fromisoformat(started_at)
+                    row["elapsed_seconds"] = round(
+                        max(0.0, (timestamp - started).total_seconds()), 3
+                    )
+                except (TypeError, ValueError):
+                    row["elapsed_seconds"] = 0
+            substeps[key] = row
+            branch_state["substeps"] = substeps
+            branch_state["updated_at"] = timestamp.isoformat()
+            task.processing_state_json = json.dumps(state, ensure_ascii=False)
+            task.updated_at = timestamp
+
+            stage_name = f"{branch}.{key}"
+            stage_payload = json.dumps({
+                "label": label,
+                "message": message,
+                "elapsed_seconds": row.get("elapsed_seconds"),
+                "metadata": metadata or {},
+            }, ensure_ascii=False)
+            if status == "running":
+                db.add(StageResult(
+                    task_id=task_id,
+                    stage=stage_name,
+                    status="running",
+                    result_json=stage_payload,
+                ))
+            else:
+                running = (
+                    await db.execute(
+                        select(StageResult)
+                        .where(
+                            StageResult.task_id == task_id,
+                            StageResult.stage == stage_name,
+                            StageResult.status == "running",
+                        )
+                        .order_by(StageResult.id.desc())
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                error_message = message if status in {"failed", "degraded"} else None
+                if running:
+                    running.status = status
+                    running.result_json = stage_payload
+                    running.error_message = error_message
+                    running.completed_at = timestamp
+                else:
+                    db.add(StageResult(
+                        task_id=task_id,
+                        stage=stage_name,
+                        status=status,
+                        result_json=stage_payload,
+                        error_message=error_message,
+                        completed_at=timestamp,
+                    ))
+            await db.commit()
+            event_name = branch_state.get("stage") or "pipeline_detail"
+            payload = {
+                "branch": branch,
+                "stage": event_name,
+                "substep": row,
+                "processing_state": state,
+            }
+    await sse_manager.emit(task_id, event_name, payload)
 
 
 async def _set_stage(
@@ -360,6 +577,7 @@ def _aligned_blocks(frames: list[dict], segments: list[dict], duration: float):
         motion_summary = motion.get("motion") or ""
         summary_parts = [part for part in (visual_summary, motion_summary, transcript) if part]
         summary = "；".join(summary_parts)[:900] or "该片段暂无可用语音或视觉摘要。"
+        title = _content_focused_title(title, summary, f"关键镜头 {index + 1}")
         points = list(visual.get("key_points") or [])
         points.extend(_sentences(transcript, 4))
         points = list(dict.fromkeys(point for point in points if point))[:5]
@@ -373,7 +591,7 @@ def _aligned_blocks(frames: list[dict], segments: list[dict], duration: float):
             "title": title,
             "summary": summary,
             "key_points": points,
-            "review_questions": [f"{title} 在这段视频中承担了什么叙事或表达作用？"],
+            "review_questions": [f"{title} 的核心内容和关键依据是什么？"],
             "ocr_text": frame.get("ocr_text", ""),
             "image_url": frame.get("image_url", ""),
             "confidence": frame.get("confidence", 0.7),
@@ -420,7 +638,13 @@ def _llm_enhance_sync(blocks: list[dict], note_style: str, note_model: str):
         "将以下已按镜头对齐的视频材料整理为 JSON 对象 {\"blocks\": [...]}。"
         "必须保留每项 id、frame_id、timestamp、end_time、image_url、ocr_text、confidence、"
         "visual_analysis、clip_analysis、shot_metrics，仅改进 title、summary、key_points 和"
-        f"review_questions。笔记类型：{note_style}\n"
+        "review_questions。先准确生成 summary 和 key_points，再根据它们提炼 title。"
+        "title 必须突出当前片段具体讨论的对象、方法、观点或结论，让用户只看标题就知道本段内容；"
+        "建议 8 到 20 个汉字。禁止单独使用开篇、介绍、背景、标准、分析、案例、总结、结尾、"
+        "主要内容、第几部分等结构性词语。相邻标题不得仅有序号差异。"
+        "review_questions 必须检验内容理解，不得只询问片段的叙事作用。"
+        "不得添加输入材料中不存在的事实。"
+        f"笔记类型：{note_style}\n"
         + json.dumps(blocks, ensure_ascii=False)[:60000]
     )
     parsed, usage = _request_json_sync(
@@ -440,7 +664,7 @@ def _llm_enhance_sync(blocks: list[dict], note_style: str, note_model: str):
     enhanced = parsed.get("blocks", []) if isinstance(parsed, dict) else []
     if not isinstance(enhanced, list) or not enhanced:
         raise RuntimeError(f"{provider} note enhancement returned no blocks")
-    return enhanced, {
+    return _merge_enhanced_blocks(blocks, enhanced), {
         "enabled": True,
         "model": model,
         "provider": provider,
@@ -449,9 +673,18 @@ def _llm_enhance_sync(blocks: list[dict], note_style: str, note_model: str):
 
 
 def _markdown(task: SnapTask, blocks: list[dict], visual_analysis: dict):
-    overall = visual_analysis.get("summary") or "视频已完成镜头、视觉语义与语音内容对齐。"
+    overall = (
+        visual_analysis.get("content_summary")
+        or visual_analysis.get("summary")
+        or "视频已完成镜头、视觉语义与语音内容对齐。"
+    )
+    document_title = (
+        task.generated_title
+        or visual_analysis.get("video_title")
+        or Path(task.filename).stem
+    )
     lines = [
-        f"# {Path(task.filename).stem}",
+        f"# {document_title}",
         "",
         f"> 视频时长：{task.duration:.0f} 秒 · SnapNote 自动生成",
         "",
@@ -566,7 +799,6 @@ async def _run_local_vision_branch(
     task_id: str,
     video_path: str,
     duration: float,
-    frames_dir: Path,
 ):
     await _set_stage(task_id, STAGES[3], "vision", 0)
     shots, shot_stats = await analyze_shots(video_path, duration)
@@ -575,35 +807,217 @@ async def _run_local_vision_branch(
         STAGES[3],
         "vision",
         45,
-        f"检测到 {shot_stats['detected_shots']} 个镜头",
+        f"检测到 {shot_stats['detected_shots']} 个候选镜头，等待语音语义选帧",
         shot_stats,
     )
+    return shots, shot_stats
 
+
+async def _select_extract_and_repair_frames(
+    task_id: str,
+    video_path: str,
+    duration: float,
+    frames_dir: Path,
+    shot_candidates: list[dict],
+    segments: list[dict],
+):
+    """Select frames after the ASR/vision join and repair uncovered ranges."""
     await _set_stage(task_id, STAGES[4], "vision", 45)
-    frames = await extract_keyframes(video_path, shots, frames_dir)
+    await _record_pipeline_substep(
+        task_id,
+        "vision",
+        "semantic_selection",
+        "语义覆盖选帧",
+        "running",
+        "正在根据转写边界与场景变化建立微语义单元",
+        {"candidate_shots": len(shot_candidates), "transcript_segments": len(segments)},
+    )
+    units = build_semantic_units(segments, shot_candidates, duration)
+    selected_shots, selection_stats = select_shots_for_semantic_coverage(
+        shot_candidates, units, duration
+    )
+    await _record_pipeline_substep(
+        task_id,
+        "vision",
+        "semantic_selection",
+        "语义覆盖选帧",
+        "completed",
+        f"已从 {len(shot_candidates)} 个候选中选择 {len(selected_shots)} 个语义锚点",
+        selection_stats,
+    )
+    await _record_pipeline_substep(
+        task_id,
+        "vision",
+        "frame_extraction",
+        "关键帧抽取",
+        "running",
+        f"正在抽取 {len(selected_shots)} 张关键帧",
+        {"selected_shots": len(selected_shots)},
+    )
+    frames = await extract_keyframes(video_path, selected_shots, frames_dir)
     if not frames:
         raise RuntimeError("未能提取任何关键帧")
+    await _record_pipeline_substep(
+        task_id,
+        "vision",
+        "frame_extraction",
+        "关键帧抽取",
+        "completed",
+        f"成功抽取 {len(frames)} / {len(selected_shots)} 张关键帧",
+        {
+            "selected_shots": len(selected_shots),
+            "extracted_frames": len(frames),
+            "failed_extractions": len(selected_shots) - len(frames),
+        },
+    )
     await _set_stage(
         task_id,
         STAGES[4],
         "vision",
         75,
-        f"提取 {len(frames)} 张高质量关键帧",
-        {"frame_count": len(frames)},
+        f"按 {len(units)} 个微语义单元提取 {len(frames)} 张关键帧",
+        {
+            "frame_count": len(frames),
+            "semantic_unit_count": len(units),
+            **selection_stats,
+        },
     )
 
     await _set_stage(task_id, STAGES[5], "vision", 75)
+    await _record_pipeline_substep(
+        task_id,
+        "vision",
+        "coverage_audit",
+        "覆盖审计",
+        "running",
+        "正在执行语义保护去重并检查覆盖空洞",
+        {"frame_count": len(frames), "semantic_unit_count": len(units)},
+    )
     frames = await asyncio.to_thread(deduplicate_frames, frames, frames_dir)
+    initial_coverage = audit_frame_coverage(frames, units, duration)
+    await _record_pipeline_substep(
+        task_id,
+        "vision",
+        "coverage_audit",
+        "覆盖审计",
+        "completed",
+        (
+            f"语义覆盖率 {initial_coverage['semantic_coverage_ratio']:.0%}，"
+            f"最大空洞 {initial_coverage['max_frame_gap_seconds']:.1f} 秒"
+        ),
+        initial_coverage,
+    )
+    attempted_shot_ids = {
+        str(shot.get("shot_id")) for shot in selected_shots if shot.get("shot_id")
+    }
+    next_frame_index = len(selected_shots) + 1
+    repair_rounds = 0
+    repair_count = 0
+    maximum_repair_rounds = max(0, int(FRAME_COVERAGE_REPAIR_ATTEMPTS))
+    repairs = select_coverage_repairs(
+        frames,
+        shot_candidates,
+        units,
+        duration,
+        attempted_shot_ids,
+    ) if maximum_repair_rounds else []
+    if repairs:
+        await _record_pipeline_substep(
+            task_id,
+            "vision",
+            "coverage_repair",
+            "定向补帧",
+            "running",
+            f"发现 {len(repairs)} 个缺失位置，开始第 1 轮定向补帧",
+            {"repair_round": 1, "planned_repairs": len(repairs)},
+        )
+    for attempt in range(maximum_repair_rounds):
+        if attempt:
+            repairs = select_coverage_repairs(
+                frames,
+                shot_candidates,
+                units,
+                duration,
+                attempted_shot_ids,
+            )
+        if not repairs:
+            break
+        await _set_stage(
+            task_id,
+            STAGES[5],
+            "vision",
+            min(96, 82 + round((attempt + 1) / max(1, maximum_repair_rounds) * 12)),
+            f"正在进行第 {attempt + 1} / {maximum_repair_rounds} 轮定向补帧",
+        )
+        repair_rounds += 1
+        repair_count += len(repairs)
+        attempted_shot_ids.update(
+            str(shot.get("shot_id")) for shot in repairs if shot.get("shot_id")
+        )
+        repaired_frames = await extract_keyframes(
+            video_path,
+            repairs,
+            frames_dir,
+            start_index=next_frame_index,
+        )
+        next_frame_index += len(repairs)
+        frames.extend(repaired_frames)
+        frames.sort(key=lambda frame: float(frame.get("timestamp", 0)))
+        frames = await asyncio.to_thread(deduplicate_frames, frames, frames_dir)
+
+    final_coverage = audit_frame_coverage(frames, units, duration)
+    if repair_rounds:
+        await _record_pipeline_substep(
+            task_id,
+            "vision",
+            "coverage_repair",
+            "定向补帧",
+            "completed",
+            (
+                f"完成 {repair_rounds} 轮、{repair_count} 个位置的定向补帧；"
+                f"最终覆盖率 {final_coverage['semantic_coverage_ratio']:.0%}"
+            ),
+            {
+                **final_coverage,
+                "coverage_repair_rounds": repair_rounds,
+                "repair_candidates": repair_count,
+            },
+        )
+    else:
+        await _record_pipeline_substep(
+            task_id,
+            "vision",
+            "coverage_repair",
+            "定向补帧",
+            "skipped",
+            (
+                "定向补帧未启用"
+                if not maximum_repair_rounds
+                else "覆盖检查未发现可执行的补帧位置"
+            ),
+            final_coverage,
+        )
+
+    coverage_stats = {
+        **selection_stats,
+        **final_coverage,
+        "extracted_frames": len(frames),
+        "coverage_repair_rounds": repair_rounds,
+    }
     await _save_frames(task_id, frames)
     await _set_stage(
         task_id,
         STAGES[5],
         "vision",
         100,
-        f"去重后保留 {len(frames)} 张关键帧",
-        {"frame_count": len(frames)},
+        (
+            f"保留 {len(frames)} 张关键帧，"
+            f"语义覆盖率 {coverage_stats['semantic_coverage_ratio']:.0%}，"
+            f"最大空洞 {coverage_stats['max_frame_gap_seconds']:.1f} 秒"
+        ),
+        {"frame_count": len(frames), **coverage_stats},
     )
-    return frames, shot_stats
+    return frames, coverage_stats
 
 
 async def _gather_required(*coroutines):
@@ -696,8 +1110,47 @@ async def _run_multimodal_branch(
                 "usage": {},
             }
 
-    image_result = await run_image_understanding()
+    await _record_pipeline_substep(
+        task_id,
+        "multimodal",
+        "keyframe_understanding",
+        "关键帧理解",
+        "running",
+        f"正在分析 {len(frames)} 张关键帧",
+        {"model": MIMO_VISION_MODEL, "frame_count": len(frames)},
+    )
+    try:
+        image_result = await run_image_understanding()
+    except Exception as error:
+        await _record_pipeline_substep(
+            task_id,
+            "multimodal",
+            "keyframe_understanding",
+            "关键帧理解",
+            "failed",
+            str(error)[:500],
+            {"model": MIMO_VISION_MODEL, "error": str(error)[:500]},
+        )
+        raise
     image_frames, image_stats = image_result
+    image_status = (
+        "completed" if image_stats.get("enabled")
+        else "degraded" if image_stats.get("error")
+        else "skipped"
+    )
+    await _record_pipeline_substep(
+        task_id,
+        "multimodal",
+        "keyframe_understanding",
+        "关键帧理解",
+        image_status,
+        (
+            f"完成 {image_stats.get('analyzed_frames', 0)} 张关键帧分析"
+            if image_status == "completed"
+            else image_stats.get("error") or "视觉理解未启用，保留本地关键帧"
+        ),
+        image_stats,
+    )
     # 第三个参数保留为空，确保合并逻辑兼容旧的 OCR 字段；ocr_text 由 MiMo
     # 的 visible_text 回填，详见 mimo_vision.understand_keyframes。
     frames = _merge_frame_results(frames, image_frames, [])
@@ -713,6 +1166,15 @@ async def _run_multimodal_branch(
 
     await _set_stage(task_id, STAGES[8], "multimodal", 45)
     clip_stats = {"enabled": False, "clip_count": 0, "usage": {}}
+    await _record_pipeline_substep(
+        task_id,
+        "multimodal",
+        "clip_understanding",
+        "动态片段理解",
+        "running",
+        "正在生成并分析动态代理片段",
+        {"model": MIMO_VISION_MODEL, "max_clips": MIMO_VISION_MAX_CLIPS},
+    )
     try:
         clips = await create_silent_proxy_clips(
             video_path, frames, clips_dir, MIMO_VISION_MAX_CLIPS
@@ -720,11 +1182,38 @@ async def _run_multimodal_branch(
         frames, clip_stats = await understand_clips(clips, frames, segments)
     except Exception as error:
         if MIMO_VISION_REQUIRED:
+            await _record_pipeline_substep(
+                task_id,
+                "multimodal",
+                "clip_understanding",
+                "动态片段理解",
+                "failed",
+                str(error)[:500],
+                {"model": MIMO_VISION_MODEL, "error": str(error)[:500]},
+            )
             raise
         clip_stats = {"enabled": False, "error": str(error)[:500], "usage": {}}
     finally:
         if clips_dir.parent == frames_dir.parent:
             shutil.rmtree(clips_dir, ignore_errors=True)
+    clip_status = (
+        "completed" if clip_stats.get("enabled")
+        else "degraded" if clip_stats.get("error")
+        else "skipped"
+    )
+    await _record_pipeline_substep(
+        task_id,
+        "multimodal",
+        "clip_understanding",
+        "动态片段理解",
+        clip_status,
+        (
+            f"完成 {clip_stats.get('analyzed_clips', 0)} 个动态片段分析"
+            if clip_status == "completed"
+            else clip_stats.get("error") or "没有需要补充分析的动态片段"
+        ),
+        clip_stats,
+    )
     await _save_frames(task_id, frames)
     await _set_stage(
         task_id,
@@ -742,33 +1231,104 @@ async def _run_multimodal_branch(
         STAGES[9],
         "multimodal",
         70,
-        "正在并行归纳整片风格与增强笔记结构",
+        "正在等待 AI 整片分析与笔记增强；模型响应和重试可能需要几分钟",
     )
     base_blocks = _aligned_blocks(frames, segments, duration)
 
     async def run_style_synthesis():
+        await _record_pipeline_substep(
+            task_id,
+            "multimodal",
+            "style_synthesis",
+            "整片分析",
+            "running",
+            "正在归纳整片内容、风格和叙事结构",
+            {"model": MIMO_VISION_MODEL},
+        )
         try:
-            return await summarize_video_style(frames, segments, duration)
+            result = await summarize_video_style(frames, segments, duration)
+            analysis, stats = result
+            status = "completed" if stats.get("enabled") else "skipped"
+            await _record_pipeline_substep(
+                task_id,
+                "multimodal",
+                "style_synthesis",
+                "整片分析",
+                status,
+                "整片内容、风格和叙事结构已生成" if status == "completed" else "整片 AI 分析未启用，已使用本地摘要",
+                stats,
+            )
+            return analysis, stats
         except Exception as error:
             if MIMO_VISION_REQUIRED:
+                await _record_pipeline_substep(
+                    task_id,
+                    "multimodal",
+                    "style_synthesis",
+                    "整片分析",
+                    "failed",
+                    str(error)[:500],
+                    {"model": MIMO_VISION_MODEL, "error": str(error)[:500]},
+                )
                 raise
             fallback = await summarize_video_style([], [], duration)
             fallback[1]["error"] = str(error)[:500]
+            await _record_pipeline_substep(
+                task_id,
+                "multimodal",
+                "style_synthesis",
+                "整片分析",
+                "degraded",
+                "整片 AI 分析失败，已使用本地摘要",
+                fallback[1],
+            )
             return fallback
 
     async def run_note_enhancement():
+        model = MIMO_VISION_MODEL if note_model != "deepseek" else DEEPSEEK_MODEL
+        provider = "MiMo" if note_model != "deepseek" else "DeepSeek"
+        await _record_pipeline_substep(
+            task_id,
+            "multimodal",
+            "note_enhancement",
+            "笔记增强",
+            "running",
+            "正在增强标题、摘要、重点和复习问题",
+            {"model": model, "provider": provider},
+        )
         try:
             enhanced, stats = await asyncio.to_thread(
                 _llm_enhance_sync, base_blocks, note_style, note_model
             )
+            status = "completed" if stats.get("enabled") else "skipped"
+            await _record_pipeline_substep(
+                task_id,
+                "multimodal",
+                "note_enhancement",
+                "笔记增强",
+                status,
+                "笔记标题、摘要和复习内容已增强" if status == "completed" else "笔记增强未启用，已保留基础对齐结果",
+                stats,
+            )
             return enhanced, stats
         except Exception as error:
-            return base_blocks, {
+            stats = {
                 "enabled": False,
-                "model": MIMO_VISION_MODEL if note_model != "deepseek" else DEEPSEEK_MODEL,
+                "model": model,
+                "provider": provider,
                 "error": str(error)[:500],
                 "fallback": "aligned_blocks",
             }
+            await _record_pipeline_substep(
+                task_id,
+                "multimodal",
+                "note_enhancement",
+                "笔记增强",
+                "degraded",
+                "笔记增强失败，已保留基础对齐结果",
+                stats,
+            )
+            return base_blocks, stats
 
     (visual_analysis, style_stats), (note_blocks, note_stats) = await asyncio.gather(
         run_style_synthesis(),
@@ -784,13 +1344,14 @@ async def _run_multimodal_branch(
         task = await db.get(SnapTask, task_id)
         if task:
             task.visual_analysis_json = json.dumps(visual_analysis, ensure_ascii=False)
+            task.generated_title = _video_title(visual_analysis)
             await db.commit()
     await _set_stage(
         task_id,
         STAGES[9],
         "multimodal",
         100,
-        "整片风格、叙事和分镜画像已生成",
+        "AI 整片分析与笔记增强已完成",
         {"provider": visual_analysis.get("provider"), **style_stats},
     )
     return frames, visual_analysis, image_stats, clip_stats, style_stats, note_blocks, note_stats
@@ -804,12 +1365,39 @@ async def _mark_pipeline_failed(task_id: str, error: Exception):
             if not task:
                 return
             state = _decode_processing_state(task.processing_state_json)
-            timestamp = utcnow().isoformat()
+            failed_at = utcnow()
+            timestamp = failed_at.isoformat()
             for branch in state.values():
                 if branch.get("status") == "running":
                     branch["status"] = "failed"
                     branch["message"] = str(error)[:500]
                     branch["updated_at"] = timestamp
+                for substep in (branch.get("substeps") or {}).values():
+                    if substep.get("status") != "running":
+                        continue
+                    substep["status"] = "failed"
+                    substep["message"] = str(error)[:500]
+                    substep["updated_at"] = timestamp
+                    substep["completed_at"] = timestamp
+                    try:
+                        started = datetime.fromisoformat(substep.get("started_at", ""))
+                        substep["elapsed_seconds"] = round(
+                            max(0.0, (failed_at - started).total_seconds()), 3
+                        )
+                    except (TypeError, ValueError):
+                        substep["elapsed_seconds"] = 0
+            running_results = (
+                await db.execute(
+                    select(StageResult).where(
+                        StageResult.task_id == task_id,
+                        StageResult.status == "running",
+                    )
+                )
+            ).scalars().all()
+            for stage_result in running_results:
+                stage_result.status = "failed"
+                stage_result.error_message = str(error)[:1000]
+                stage_result.completed_at = failed_at
             task.status = "failed"
             task.current_stage = "step_error"
             task.error_message = str(error)[:1000]
@@ -861,7 +1449,7 @@ async def run_pipeline(task_id: str):
             task_id, video_path, audio_path, duration, asr_provider
         )
         vision_branch = _run_local_vision_branch(
-            task_id, video_path, duration, frames_dir
+            task_id, video_path, duration
         )
         if ENABLE_PIPELINE_PARALLELISM:
             audio_result, vision_result = await _gather_required(
@@ -871,7 +1459,16 @@ async def run_pipeline(task_id: str):
             audio_result = await audio_branch
             vision_result = await vision_branch
         segments, engine = audio_result
-        frames, shot_stats = vision_result
+        shot_candidates, shot_stats = vision_result
+        frames, coverage_stats = await _select_extract_and_repair_frames(
+            task_id,
+            video_path,
+            duration,
+            frames_dir,
+            shot_candidates,
+            segments,
+        )
+        shot_stats = {**shot_stats, **coverage_stats}
 
         (
             frames,
@@ -902,6 +1499,7 @@ async def run_pipeline(task_id: str):
         async with async_session() as db:
             task = await db.get(SnapTask, task_id)
             task.visual_analysis_json = json.dumps(visual_analysis, ensure_ascii=False)
+            task.generated_title = _video_title(visual_analysis)
             await db.commit()
 
         await _set_stage(task_id, STAGES[10], "output", 0)
@@ -980,6 +1578,7 @@ async def reset_task(task_id: str, provider: str | None = None):
         task.transcripts_json = "[]"
         task.notes_json = "[]"
         task.visual_analysis_json = "{}"
+        task.generated_title = None
         task.processing_state_json = json.dumps(new_processing_state(), ensure_ascii=False)
         task.final_markdown = ""
         if provider:

@@ -9,8 +9,9 @@
 2026-08-15 已完成以下改造：
 
 - `ffprobe` 后并行执行音频分支与本地视觉分支，可通过 `ENABLE_PIPELINE_PARALLELISM=0` 回退串行模式；
-- 音频分支负责音频提取和 ASR，本地视觉分支负责镜头扫描、关键帧提取和 pHash 去重；
-- 两条分支完成后在 MiMo 关键帧理解前汇合；
+- 音频分支负责音频提取和 ASR，本地视觉分支负责镜头扫描并保留完整候选集；
+- 两条分支完成后先建立微语义单元，再按语义覆盖和最大时间空洞约束选择、提取及去重关键帧；
+- 抽帧失败或去重后覆盖不足时，只在缺失单元和时间空洞内进行定向补帧；
 - PaddleOCR 与 MiMo 图片理解并行执行，使用独立帧副本并按 `frame_id` 合并；
 - 新增五分支持久化进度：准备视频、音频处理、画面处理、多模态理解、结果生成；
 - SSE 与任务详情 API 返回分支、阶段、说明、状态、分支百分比及单调递增总进度；
@@ -49,16 +50,20 @@ flowchart TD
     Probe --> AudioExtract["音频提取"]
     AudioExtract --> ASR["Whisper / MIMO-ASR"]
 
-    Probe --> Scan["镜头扫描"]
-    Scan --> FrameExtract["关键帧提取"]
-    FrameExtract --> Dedup["pHash 去重"]
+    Probe --> Scan["镜头扫描并保留候选"]
+
+    ASR --> Join["音频/视觉汇合"]
+    Scan --> Join
+    Join --> Units["转写 + 场景变化：微语义单元"]
+    Units --> FrameExtract["覆盖约束选帧与提取"]
+    FrameExtract --> Dedup["单元内 pHash 去重"]
+    Dedup --> Audit["语义覆盖与最大空洞审计"]
+    Audit -->|"存在空洞"| FrameExtract
 
     Dedup --> OCR["本地 OCR（按策略执行）"]
     Dedup --> PreClips["预生成高动态代理片段（可选）"]
 
-    ASR --> Join["音频/视觉汇合"]
-    Dedup --> Join
-    Join --> ImageAI["MiMo 关键帧理解：图片 + 转写"]
+    Audit --> ImageAI["MiMo 关键帧理解：图片 + 转写"]
     ImageAI --> MergeOCR["按 frame_id 合并 OCR/视觉结果"]
     OCR --> MergeOCR
     PreClips --> ClipAI["MiMo 动态片段理解"]
@@ -75,9 +80,9 @@ flowchart TD
 `ffprobe` 完成后即可同时启动：
 
 - 音频分支：`提取音频 → ASR`；
-- 本地视觉分支：`镜头扫描 → 关键帧提取 → pHash 去重`。
+- 本地视觉分支：`镜头扫描 → 保留完整镜头候选`。
 
-这两个分支都只依赖原视频和统一的处理时长，不互相依赖。它们应在 MiMo 关键帧理解前汇合，因为当前图片提示词会携带同一镜头时间范围内的转写文本。
+这两个分支都只依赖原视频和统一的处理时长，不互相依赖。它们在关键帧选择前汇合：转写边界与真实场景变化共同形成微语义单元，随后才执行代表帧提取、语义保护去重和覆盖补偿。这样既保留前半段并行，也避免在 ASR 完成前过早丢弃镜头。
 
 ### 2.2 暂不并行的边界
 
